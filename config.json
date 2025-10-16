@@ -1,0 +1,7 @@
+{
+  "client_id": "b6292429-70a7-4de5-8c14-f152f22e77c9",
+  "scopes": ["Files.ReadWrite.All"],
+  "chunk_size_mb": 10,
+  "state_store": "upload_state.json",
+  "token_cache_file": "token_cache.bin"
+}

@@ -1,0 +1,4 @@
+msal
+requests
+PyQt6
+tqdm
