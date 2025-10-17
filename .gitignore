@@ -1,5 +1,6 @@
 token_cache.bin
 upload_state.json
+.sessions/
 venv/
 *.pyc
 __pycache__/
