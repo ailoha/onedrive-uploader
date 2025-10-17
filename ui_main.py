@@ -1,7 +1,7 @@
 # ui_main.py
 import sys, os
 from PyQt6.QtWidgets import QApplication, QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QLabel, QListWidget, QFileDialog, QProgressBar, QTextEdit, QMessageBox
-from PyQt6.QtCore import QThread, pyqtSignal
+from PyQt6.QtCore import QThread, pyqtSignal, Qt
 from auth import list_accounts, acquire_token_interactive, remove_account
 from uploader import upload_items
 
@@ -32,7 +32,7 @@ class UploadWorker(QThread):
 class MainWindow(QWidget):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("OneDrive Folder Uploader")
+        self.setWindowTitle("OneDrive Uploader")
         self.resize(800, 600)
         self.layout = QVBoxLayout()
         # accounts area
@@ -48,9 +48,11 @@ class MainWindow(QWidget):
         # folder area
         folder_layout = QHBoxLayout()
         self.lbl_folder = QLabel("No folder selected")
-        self.btn_choose = QPushButton("Choose Folder")
-        folder_layout.addWidget(self.lbl_folder, 4)
-        folder_layout.addWidget(self.btn_choose, 1)
+        self.btn_choose_files = QPushButton("Choose Files")
+        self.btn_choose_folder = QPushButton("Choose Folder")
+        folder_layout.addWidget(self.lbl_folder, 3)
+        folder_layout.addWidget(self.btn_choose_files, 1)
+        folder_layout.addWidget(self.btn_choose_folder, 1)
         # controls
         ctrl_layout = QHBoxLayout()
         self.btn_start = QPushButton("Start Upload")
@@ -80,11 +82,21 @@ class MainWindow(QWidget):
         self.folder = None
         self.remote_base = ""  # can modify to let user choose remote base
         self.refresh_accounts()
+        # remove old btn_choose connections, add new ones for files/folder
         try:
             self.btn_choose.clicked.disconnect()
-        except TypeError:
+        except Exception:
             pass
-        self.btn_choose.clicked.connect(self.choose_folder_or_file)
+        self.btn_choose_files.clicked.connect(self.choose_files)
+        self.btn_choose_folder.clicked.connect(self.choose_folder)
+
+    def shorten_path(self, path: str, max_len: int = 50) -> str:
+        """中间省略显示长路径，保留头尾"""
+        if not path or len(path) <= max_len:
+            return path
+        head_len = (max_len - 3) // 2
+        tail_len = max_len - 3 - head_len
+        return f"{path[:head_len]}...{path[-tail_len:]}"
 
     def refresh_accounts(self):
         self.acct_list.clear()
@@ -94,32 +106,63 @@ class MainWindow(QWidget):
         if accts:
             self.acct_list.setCurrentRow(0)
 
-    def choose_folder_or_file(self):
-        dlg = QFileDialog(self)
-        dlg.setFileMode(QFileDialog.FileMode.Directory)  # 只选择文件夹
-        dlg.setOption(QFileDialog.Option.ShowDirsOnly, True)
-        if dlg.exec():
-            paths = dlg.selectedFiles()
-            if not paths:
-                return
-            self.base_dir = paths[0]
-            self.selected_paths = []
-            for root, dirs, files in os.walk(self.base_dir):
-                for f in files:
-                    self.selected_paths.append(os.path.join(root, f))
-            self.lbl_folder.setText(f"Folder: {self.base_dir}")
-            # 计算总字节数（排除隐藏文件）
-            total_bytes = 0
-            for p in self.selected_paths:
-                name = os.path.basename(p)
+
+    def choose_files(self):
+        dialog = QFileDialog(self, "Select files to upload")
+        dialog.setFileMode(QFileDialog.FileMode.ExistingFiles)
+        dialog.setOption(QFileDialog.Option.DontUseNativeDialog, False)
+        if not dialog.exec():
+            return
+        selected = dialog.selectedFiles()
+        if not selected:
+            return
+
+        # 过滤掉隐藏文件
+        self.selected_paths = [f for f in selected if not os.path.basename(f).startswith('.')]
+        common_dir = os.path.dirname(os.path.commonpath(self.selected_paths))
+        self.base_dir = common_dir
+
+        # 构造显示文本
+        count = len(self.selected_paths)
+        if count == 1:
+            display_names = os.path.basename(self.selected_paths[0])
+        else:
+            display_names = ", ".join(os.path.basename(f) for f in self.selected_paths)
+            # 如果名称过长则压缩显示
+            if len(display_names) > 60:
+                display_names = display_names[:30] + "..." + display_names[-20:]
+
+        label_text = f"Files ({count}): {display_names}"
+        self.lbl_folder.setText(self.shorten_path(label_text))
+
+        # 计算总字节数
+        total_bytes = sum(os.path.getsize(p) for p in self.selected_paths if os.path.isfile(p))
+        self.total_bytes = total_bytes
+        self.log.append(f"Total upload size: {total_bytes / (1024*1024*1024):.2f} GB")
+
+    def choose_folder(self):
+        dialog = QFileDialog(self, "Select folder to upload")
+        dialog.setFileMode(QFileDialog.FileMode.Directory)
+        dialog.setOption(QFileDialog.Option.DontUseNativeDialog, False)
+        dialog.setOption(QFileDialog.Option.ShowDirsOnly, True)
+        if not dialog.exec():
+            return
+        selected = dialog.selectedFiles()
+        if not selected:
+            return
+        self.base_dir = selected[0]
+        self.selected_paths = []
+        for root, dirs, files in os.walk(self.base_dir):
+            for f in files:
+                path = os.path.join(root, f)
+                name = os.path.basename(path)
                 if name.startswith('.') or name.startswith('._') or name == 'Icon\r':
                     continue
-                try:
-                    total_bytes += os.path.getsize(p)
-                except OSError:
-                    pass
-            self.total_bytes = total_bytes
-            self.log.append(f"Total upload size: {total_bytes / (1024*1024*1024):.2f} GB")
+                self.selected_paths.append(path)
+        self.lbl_folder.setText(f"Folder: {self.shorten_path(self.base_dir)}")
+        total_bytes = sum(os.path.getsize(p) for p in self.selected_paths if os.path.isfile(p))
+        self.total_bytes = total_bytes
+        self.log.append(f"Total upload size: {total_bytes / (1024*1024*1024):.2f} GB")
 
     def add_account(self):
         try:
