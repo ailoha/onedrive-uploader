@@ -1,17 +1,29 @@
 # auth.py
-import json, os, time
+import json, os, time, sys
 from msal import PublicClientApplication, SerializableTokenCache
+from pathlib import Path
 
-CFG_PATH = "config.json"
+# Resolve config.json both in dev and in PyInstaller .app bundles
+if getattr(sys, "frozen", False) and hasattr(sys, "_MEIPASS"):
+    BASE_DIR = Path(sys._MEIPASS)
+else:
+    BASE_DIR = Path(__file__).parent
+
+CFG_PATH = str((BASE_DIR / "config.json").resolve())
 
 def load_config():
-    with open(CFG_PATH, "r", encoding="utf-8") as f:
-        return json.load(f)
+    try:
+        with open(CFG_PATH, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except FileNotFoundError:
+        raise RuntimeError(f"Missing config.json at {CFG_PATH}. If running as .app, ensure --add-data 'config.json:.' during build.")
 
 cfg = load_config()
 CLIENT_ID = cfg["client_id"]
 SCOPES = cfg.get("scopes", ["Files.ReadWrite.All"])
-CACHE_FILE = cfg.get("token_cache_file", "token_cache.bin")
+# 使用 Application Support 路径保存 token 缓存
+CACHE_FILE = str(Path.home() / "Library/Application Support/OneDriveUploader/token_cache.bin")
+Path(CACHE_FILE).parent.mkdir(parents=True, exist_ok=True)
 
 def _load_cache():
     cache = SerializableTokenCache()
