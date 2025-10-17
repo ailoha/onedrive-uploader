@@ -1,3 +1,10 @@
+def clear_old_sessions():
+    """清空 .sessions 目录，防止无效续传残留。"""
+    for f in SESS_DIR.glob("*.json"):
+        try:
+            f.unlink()
+        except Exception:
+            pass
 import os
 import time
 import json
