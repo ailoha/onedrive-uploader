@@ -14,8 +14,9 @@ from pathlib import Path
 from auth import acquire_token_silent_for_account, acquire_token_interactive
 
 # --- Session helpers for resumable upload ---
-SESS_DIR = Path('.sessions')
-SESS_DIR.mkdir(exist_ok=True)
+# 使用系统支持的用户写入路径，避免 .app 打包后无法写入问题
+SESS_DIR = Path.home() / "Library/Application Support/OneDriveUploader/sessions"
+SESS_DIR.mkdir(parents=True, exist_ok=True)
 
 def _session_key(local_path: str, remote_path: str, file_size: float) -> str:
     st = os.stat(local_path)
