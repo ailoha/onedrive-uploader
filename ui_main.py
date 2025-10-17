@@ -6,7 +6,7 @@ from auth import list_accounts, acquire_token_interactive, remove_account
 from uploader import upload_items
 
 class UploadWorker(QThread):
-    progress = pyqtSignal(int, int)
+    progress = pyqtSignal(int, int, float, float)
     log = pyqtSignal(str)
     finished = pyqtSignal(bool)
 
@@ -21,8 +21,8 @@ class UploadWorker(QThread):
         try:
             def log_cb(s):
                 self.log.emit(s)
-            def progress_cb(uploaded, total):
-                self.progress.emit(int(uploaded), int(total))
+            def progress_cb(uploaded, total, speed=None, eta=None):
+                self.progress.emit(int(uploaded), int(total), float(speed or 0), float(eta or 0))
             upload_items(self.selected_paths, base_dir=self.base_dir, account_home_id=self.account_home_id, progress_cb=progress_cb, log_cb=log_cb)
             self.finished.emit(True)
         except Exception as e:
@@ -60,6 +60,7 @@ class MainWindow(QWidget):
         ctrl_layout.addWidget(self.btn_stop)
         # progress & log
         self.progress = QProgressBar()
+        self.lbl_status = QLabel("Speed: 0 MB/s | 0 / 0 MB | ETA: 0 s")
         self.log = QTextEdit()
         self.log.setReadOnly(True)
         # assemble
@@ -67,6 +68,7 @@ class MainWindow(QWidget):
         self.layout.addLayout(folder_layout)
         self.layout.addLayout(ctrl_layout)
         self.layout.addWidget(self.progress)
+        self.layout.addWidget(self.lbl_status)
         self.layout.addWidget(self.log)
         self.setLayout(self.layout)
         # signals
@@ -106,6 +108,18 @@ class MainWindow(QWidget):
                 for f in files:
                     self.selected_paths.append(os.path.join(root, f))
             self.lbl_folder.setText(f"Folder: {self.base_dir}")
+            # 计算总字节数（排除隐藏文件）
+            total_bytes = 0
+            for p in self.selected_paths:
+                name = os.path.basename(p)
+                if name.startswith('.') or name.startswith('._') or name == 'Icon\r':
+                    continue
+                try:
+                    total_bytes += os.path.getsize(p)
+                except OSError:
+                    pass
+            self.total_bytes = total_bytes
+            self.log.append(f"Total upload size: {total_bytes / (1024*1024*1024):.2f} GB")
 
     def add_account(self):
         try:
@@ -161,12 +175,49 @@ class MainWindow(QWidget):
         self.btn_start.setEnabled(True)
         self.btn_stop.setEnabled(False)
 
-    def on_progress(self, uploaded, total):
+    def on_progress(self, uploaded, _ignored_total, speed=0, eta=0):
+        QApplication.processEvents()
+        total = getattr(self, "total_bytes", _ignored_total) or 0
         if total > 0:
             pct = int(uploaded * 100 / total)
             self.progress.setValue(pct)
+
+            # ---- 动态单位换算 ----
+            def format_size(bytes_value):
+                if bytes_value < 1024:
+                    return f"{bytes_value:.1f} B"
+                kb = bytes_value / 1024
+                if kb < 1024:
+                    return f"{kb:.1f} KB"
+                mb = kb / 1024
+                if mb < 1024:
+                    return f"{mb:.1f} MB"
+                gb = mb / 1024
+                return f"{gb:.2f} GB"
+
+            def format_time(seconds):
+                seconds = int(seconds)
+                if seconds < 60:
+                    return f"{seconds} s"
+                minutes = seconds // 60
+                if minutes < 60:
+                    return f"{minutes} min {seconds % 60} s"
+                hours = minutes // 60
+                minutes = minutes % 60
+                secs = seconds % 60
+                return f"{hours} h {minutes} m {secs} s"
+
+            uploaded_str = format_size(uploaded)
+            total_str = format_size(total)
+            mbps = speed / (1024 * 1024)
+            eta_str = format_time(eta)
+
+            self.lbl_status.setText(
+                f"{uploaded_str} / {total_str} | {mbps:.2f} MB/s | ETA: {eta_str}"
+            )
         else:
             self.progress.setValue(0)
+            self.lbl_status.setText("Speed: 0 MB/s | 0 / 0 | ETA: 0 s")
 
     def on_finished(self, ok):
         self.btn_start.setEnabled(True)
