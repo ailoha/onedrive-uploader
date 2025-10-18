@@ -49,6 +49,23 @@ def _initial_adaptive_chunk_size(file_size: float) -> int:
 SESS_DIR = Path.home() / "Library/Application Support/OneDriveUploader/sessions"
 SESS_DIR.mkdir(parents=True, exist_ok=True)
 
+# --- Batch-level resume state for multi-file uploads ---
+STATE_FILE = SESS_DIR / "batch_state.json"
+
+def _load_batch_state():
+    if STATE_FILE.exists():
+        try:
+            return json.loads(STATE_FILE.read_text(encoding='utf-8'))
+        except Exception:
+            return {}
+    return {}
+
+def _save_batch_state(state: dict):
+    try:
+        STATE_FILE.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding='utf-8')
+    except Exception:
+        pass
+
 # Thread-local shared HTTP session for robust connection reuse
 _tls = threading.local()
 
@@ -197,7 +214,16 @@ def upload_items(file_list, base_dir="", remote_base="", account_home_id=None, p
     if log_cb:
         log_cb(f"Found {len(abs_file_list)} files, total {total_bytes / (1024*1024*1024):.2f} GB")
 
+    # --- Batch resume state ---
+    state = _load_batch_state()
+    file_states = state.get("files", {})
+
     uploaded_bytes = 0
+    # Pre-calculate already uploaded bytes for skipped files
+    for abs_path, size in abs_file_list:
+        if file_states.get(abs_path) == "done":
+            uploaded_bytes += size
+
     start_time = time.time()
 
     for abs_path, size in abs_file_list:
@@ -205,6 +231,12 @@ def upload_items(file_list, base_dir="", remote_base="", account_home_id=None, p
             if log_cb:
                 log_cb("Stop requested by user. Halting before next file.")
             break
+
+        # Skip already uploaded files (batch-level resume)
+        if file_states.get(abs_path) == "done":
+            if log_cb:
+                log_cb(f"Skipping already uploaded file: {abs_path}")
+            continue
 
         rel = os.path.relpath(abs_path, base_dir) if base_dir else os.path.basename(abs_path)
         rel = os.path.join(top_level_name, rel)
@@ -230,9 +262,20 @@ def upload_items(file_list, base_dir="", remote_base="", account_home_id=None, p
                     progress_cb(total_uploaded, total_bytes)
 
         actual_size = upload_file(abs_path, rp, account_home_id=account_home_id, progress_fn=pf, log_fn=log_cb, should_stop=should_stop)
+
+        # --- Batch state update after file upload ---
+        if actual_size >= size:
+            file_states[abs_path] = "done"
+        else:
+            file_states[abs_path] = "incomplete"
+        _save_batch_state({"base_dir": base_dir, "files": file_states})
+
         uploaded_bytes += actual_size
 
         if actual_size < size:
+            # Mark as incomplete before breaking
+            file_states[abs_path] = "incomplete"
+            _save_batch_state({"base_dir": base_dir, "files": file_states})
             if log_cb:
                 log_cb("Stopped during file upload. Session saved for resume.")
             break
@@ -242,6 +285,14 @@ def upload_items(file_list, base_dir="", remote_base="", account_home_id=None, p
                 progress_cb(uploaded_bytes, total_bytes, 0, 0)
             except TypeError:
                 progress_cb(uploaded_bytes, total_bytes)
+
+    # If all files uploaded successfully, remove batch state file
+    all_done = all(file_states.get(abs_path) == "done" for abs_path, _ in abs_file_list)
+    if all_done:
+        try:
+            STATE_FILE.unlink()
+        except Exception:
+            pass
 
     if log_cb:
         duration = time.time() - start_time
@@ -393,15 +444,35 @@ def upload_file(local_path, remote_path, account_home_id=None, progress_fn=None,
                         pass
 
             if resp.status_code == 404:
+                # Upload session expired or invalidated by server. Try to recreate automatically.
                 try:
                     q = session.get(upload_url, headers={"Authorization": f"Bearer {token}"}, timeout=30)
                     if q.status_code == 404:
                         if log_fn:
-                            log_fn("Upload session expired or invalidated by server. Saving progress and stopping.")
+                            log_fn("Upload session expired or invalidated by server. Attempting to recreate session and resume.")
                         _delete_session(key)
-                        return uploaded_bytes
-                except Exception:
-                    pass
+                        # Create new session
+                        session_url = f"https://graph.microsoft.com/v1.0/me/drive/root:/{remote_path}:/createUploadSession"
+                        session = _get_session()
+                        r = session.post(session_url, headers=headers_json, json={}, timeout=30)
+                        if r.status_code not in (200, 201):
+                            if log_fn:
+                                log_fn(f"Failed to recreate upload session: {r.status_code} {r.text}")
+                            return uploaded_bytes
+                        resp = r.json()
+                        upload_url = resp['uploadUrl']
+                        sess = {"uploadUrl": upload_url, "remote_path": remote_path}
+                        _save_session(key, sess)
+                        # Seek to current uploaded_bytes position
+                        f.seek(uploaded_bytes)
+                        if log_fn:
+                            log_fn("New upload session created. Resuming upload from previous position.")
+                        backoff = 1.0
+                        continue
+                except Exception as ex:
+                    if log_fn:
+                        log_fn(f"Failed to recreate upload session after 404: {ex}")
+                    return uploaded_bytes
 
             if resp.status_code in (200, 201):
                 # finished
