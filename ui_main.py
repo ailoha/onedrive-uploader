@@ -50,7 +50,7 @@ class MainWindow(QWidget):
         folder_layout = QHBoxLayout()
         folder_btn_layout = QVBoxLayout()
         self.lbl_folder = QLabel("No folder selected")
-        self.lbl_folder.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
+        self.lbl_folder.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
         folder_layout.setContentsMargins(0,0,0,0)
         self.btn_choose = QPushButton("Choose Files / Folders")
         folder_btn_layout.addWidget(self.btn_choose)
@@ -89,14 +89,6 @@ class MainWindow(QWidget):
         # Connect the unified choose button
         self.btn_choose.clicked.connect(self.choose_files_and_folders)
 
-    def shorten_path(self, path: str, max_len: int = 50) -> str:
-        """中间省略显示长路径，保留头尾"""
-        if not path or len(path) <= max_len:
-            return path
-        head_len = (max_len - 3) // 2
-        tail_len = max_len - 3 - head_len
-        return f"{path[:head_len]}...{path[-tail_len:]}"
-
     def refresh_accounts(self):
         self.acct_list.clear()
         accts = list_accounts()
@@ -104,7 +96,6 @@ class MainWindow(QWidget):
             self.acct_list.addItem(f"{a.get('username')}  [{a.get('home_account_id')}]")
         if accts:
             self.acct_list.setCurrentRow(0)
-
 
     # Unified file/folder selection using NSOpenPanel
     def choose_files_and_folders(self):
@@ -179,60 +170,44 @@ class MainWindow(QWidget):
 
     def update_folder_label(self):
         full_list = getattr(self, '_full_list', [])
-        label_prefix = getattr(self, '_label_prefix', '')
+        prefix = getattr(self, '_label_prefix', '')
         available_width = self.lbl_folder.width()
         if available_width <= 0:
             available_width = self.lbl_folder.sizeHint().width()
         metrics = self.lbl_folder.fontMetrics()
-
-        # Compose label_text trying full list first
-        items = full_list
-        prefix = label_prefix
-        full_text = prefix + ", ".join(items)
-        if metrics.horizontalAdvance(full_text) <= available_width:
-            display_text = full_text
-            self.lbl_folder.setText(display_text)
+        # build full text
+        text = prefix + ", ".join(full_list)
+        if metrics.horizontalAdvance(text) <= available_width:
+            self.lbl_folder.setText(text)
             return
-
-        # Dynamic truncation
-        left = []
-        right = []
-        remaining = items[:]
-
+        # If too long, build truncated
+        left = 0; right = len(full_list)
         # Reserve space for "..."
         ellipsis = "..."
-        ellipsis_width = metrics.horizontalAdvance(ellipsis)
-        prefix_width = metrics.horizontalAdvance(prefix)
-        half_width = available_width / 2
-
-        # Add from start to left while prefix + left + ", ... something" fits half available_width
-        current_text = prefix
-        while remaining:
-            next_item = remaining[0]
-            test_text = current_text + next_item + ", "
-            if metrics.horizontalAdvance(test_text) < half_width:
-                left.append(next_item)
-                current_text = test_text
-                remaining.pop(0)
+        # Determine how many items from start and end
+        left_items = []
+        cur_text = prefix
+        for item in full_list:
+            test = prefix + ", ".join(left_items + [item]) + ", " + ellipsis
+            if metrics.horizontalAdvance(test) < available_width / 2:
+                left_items.append(item)
             else:
                 break
-
-        # Add from end to right while total fits
-        current_text = prefix + ", ".join(left) + ", " + ellipsis if left else prefix + ellipsis
-        remaining_right = remaining[:]
-        while remaining_right:
-            next_item = remaining_right[-1]
-            test_list = left + [ellipsis] + right + [next_item]
-            test_text = prefix + ", ".join(test_list)
+        right_items = []
+        for item in reversed(full_list[len(left_items):]):
+            test_list = left_items + [ellipsis] + right_items
+            test_text = prefix + ", ".join(test_list + [item])
             if metrics.horizontalAdvance(test_text) <= available_width:
-                right.insert(0, next_item)
-                remaining_right.pop()
+                right_items.insert(0, item)
             else:
                 break
-
-        display_list = left + [ellipsis] + right
-        display_text = prefix + ", ".join(display_list)
-        self.lbl_folder.setText(display_text)
+        if not left_items and not right_items:
+            # fallback show prefix only
+            self.lbl_folder.setText(prefix.rstrip(": "))
+            return
+        display_list = left_items + [ellipsis] + right_items
+        final = prefix + ", ".join(display_list)
+        self.lbl_folder.setText(final)
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
