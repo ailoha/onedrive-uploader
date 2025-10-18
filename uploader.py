@@ -8,6 +8,7 @@ from auth import acquire_token_silent_for_account, acquire_token_interactive
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 import random
+import threading
 
 # --- Adaptive chunk sizing constants (OneDrive requires 320KiB multiples; practical cap 60MiB) ---
 _CHUNK_ALIGN = 320 * 1024  # 320 KiB
@@ -15,7 +16,7 @@ _MIN_CHUNK = 2 * 1024 * 1024  # 2 MiB
 _MAX_CHUNK = 32 * 1024 * 1024  # 32 MiB (safe, below Graph 60 MiB recommendation)
 _TARGET_CHUNK_SECONDS = 8.0
 _ADJUST_EVERY_N_CHUNKS = 2
-_ADJUST_SMOOTHING = 0.6  # EMA for speed smoothing
+_ADJUST_SMOOTHING = 0.3  # EMA for speed smoothing
 
 def _round_to_320k(n_bytes: int) -> int:
     """Round up to the nearest 320KiB multiple, except allow smaller for the final fragment."""
@@ -48,20 +49,43 @@ def _initial_adaptive_chunk_size(file_size: float) -> int:
 SESS_DIR = Path.home() / "Library/Application Support/OneDriveUploader/sessions"
 SESS_DIR.mkdir(parents=True, exist_ok=True)
 
-def _create_session():
-    session = requests.Session()
+# Thread-local shared HTTP session for robust connection reuse
+_tls = threading.local()
+
+def _get_session():
+    """Return a per-thread shared requests.Session with retry + connection pooling.
+    This avoids rebuilding adapters and TCP pools for every chunk while keeping
+    thread-safety. Reuses connections for higher throughput and lower CPU.
+    """
+    s = getattr(_tls, "session", None)
+    if s is not None:
+        return s
+    s = requests.Session()
     retry = Retry(
-        total=7,
-        connect=7, read=7, status=7,
+        total=5,
+        connect=5, read=5, status=5,
         backoff_factor=1.2,
         status_forcelist=[429, 500, 502, 503, 504],
-        allowed_methods=["HEAD","GET","PUT","POST"]
+        allowed_methods=frozenset(["HEAD", "GET", "PUT", "POST"]),
+        respect_retry_after_header=True,
+        raise_on_status=False,
     )
-    adapter = HTTPAdapter(max_retries=retry, pool_connections=16, pool_maxsize=16, pool_block=True)
-    session.mount("https://", adapter)
-    session.mount("http://", adapter)
-    session.headers.update({"Connection": "keep-alive"})
-    return session
+    adapter = HTTPAdapter(max_retries=retry, pool_connections=32, pool_maxsize=32, pool_block=True)
+    s.mount("https://", adapter)
+    s.mount("http://", adapter)
+    s.headers.update({"Connection": "keep-alive"})
+    _tls.session = s
+    return s
+
+def _reset_session():
+    """Close and clear the current thread's session so a fresh one is created next time."""
+    s = getattr(_tls, "session", None)
+    if s is not None:
+        try:
+            s.close()
+        except Exception:
+            pass
+        _tls.session = None
 
 def clear_old_sessions():
     """清空 .sessions 目录，防止无效续传残留。"""
@@ -248,12 +272,12 @@ def upload_file(local_path, remote_path, account_home_id=None, progress_fn=None,
     # Create session if none
     if not upload_url:
         session_url = f"https://graph.microsoft.com/v1.0/me/drive/root:/{remote_path}:/createUploadSession"
-        with _create_session() as session:
-            r = session.post(session_url, headers=headers_json, json={}, timeout=30)
-            if r.status_code not in (200, 201):
-                raise RuntimeError(f"Failed to create upload session: {r.status_code} {r.text}")
-            resp = r.json()
-            upload_url = resp['uploadUrl']
+        session = _get_session()
+        r = session.post(session_url, headers=headers_json, json={}, timeout=30)
+        if r.status_code not in (200, 201):
+            raise RuntimeError(f"Failed to create upload session: {r.status_code} {r.text}")
+        resp = r.json()
+        upload_url = resp['uploadUrl']
         sess = {"uploadUrl": upload_url, "remote_path": remote_path}
         _save_session(key, sess)
         if log_fn:
@@ -262,15 +286,15 @@ def upload_file(local_path, remote_path, account_home_id=None, progress_fn=None,
     # Try to query current progress to resume
     uploaded_bytes = 0
     try:
-        with _create_session() as session:
-            q = session.get(upload_url, headers={"Authorization": f"Bearer {token}"}, timeout=30)
-            if q.status_code in (200, 201, 202):
-                # Prefer headers if present. Fallback to nextExpectedRanges JSON.
-                hdr_pos = _parse_uploaded_from_headers(q.headers.get("Range") or q.headers.get("Content-Range"))
-                if hdr_pos is not None:
-                    uploaded_bytes = int(hdr_pos)
-                else:
-                    uploaded_bytes = int(_parse_next_start(q.json()))
+        session = _get_session()
+        q = session.get(upload_url, headers={"Authorization": f"Bearer {token}"}, timeout=30)
+        if q.status_code in (200, 201, 202):
+            # Prefer headers if present. Fallback to nextExpectedRanges JSON.
+            hdr_pos = _parse_uploaded_from_headers(q.headers.get("Range") or q.headers.get("Content-Range"))
+            if hdr_pos is not None:
+                uploaded_bytes = int(hdr_pos)
+            else:
+                uploaded_bytes = int(_parse_next_start(q.json()))
     except Exception:
         pass
 
@@ -290,7 +314,8 @@ def upload_file(local_path, remote_path, account_home_id=None, progress_fn=None,
     max_retries = 5
     backoff = 1.0
 
-    with open(local_path, 'rb') as f, _create_session() as session:
+    with open(local_path, 'rb') as f:
+        session = _get_session()
         # seek to resume point
         if uploaded_bytes > 0:
             f.seek(int(uploaded_bytes))
@@ -316,9 +341,11 @@ def upload_file(local_path, remote_path, account_home_id=None, progress_fn=None,
                 t0 = time.time()
                 resp = session.put(upload_url, headers=put_headers, data=chunk, timeout=(10, 120))
             except Exception as ex:
-                # network error, retrying with backoff
                 if log_fn:
-                    log_fn(f"Network error, retrying: {ex}")
+                    log_fn(f"Network error, resetting session and retrying: {ex}")
+                _reset_session()
+                session = _get_session()
+                # Exponential backoff with jitter
                 time.sleep(min(backoff * (0.5 + random.random()), 30))
                 backoff = min(backoff * 2, 30)
                 chunks_since_adjust = 0
@@ -455,6 +482,9 @@ def upload_file(local_path, remote_path, account_home_id=None, progress_fn=None,
             # other errors -> retry with backoff and re-query nextExpectedRanges
             if log_fn:
                 log_fn(f"Chunk upload failed: {resp.status_code} {resp.text[:200]}")
+            # Reset session to avoid stale or closed connections after server errors
+            _reset_session()
+            session = _get_session()
             time.sleep(min(backoff * (0.5 + random.random()), 30))
             backoff = min(backoff * 2, 30)
             chunks_since_adjust = 0
