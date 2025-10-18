@@ -2,3 +2,4 @@ msal
 requests
 PyQt6
 tqdm
+pyobjc-framework-Cocoa

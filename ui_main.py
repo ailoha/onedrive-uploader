@@ -1,9 +1,10 @@
 # ui_main.py
 import sys, os
-from PyQt6.QtWidgets import QApplication, QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QLabel, QListWidget, QFileDialog, QProgressBar, QTextEdit, QMessageBox
+from PyQt6.QtWidgets import QApplication, QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QLabel, QListWidget, QFileDialog, QProgressBar, QTextEdit, QMessageBox, QSizePolicy
 from PyQt6.QtCore import QThread, pyqtSignal, Qt
 from auth import list_accounts, acquire_token_interactive, remove_account
 from uploader import upload_items
+from Cocoa import NSOpenPanel
 
 class UploadWorker(QThread):
     progress = pyqtSignal(int, int, float, float)
@@ -47,12 +48,14 @@ class MainWindow(QWidget):
         acct_layout.addLayout(acct_btn_layout, 1)
         # folder area
         folder_layout = QHBoxLayout()
+        folder_btn_layout = QVBoxLayout()
         self.lbl_folder = QLabel("No folder selected")
-        self.btn_choose_files = QPushButton("Choose Files")
-        self.btn_choose_folder = QPushButton("Choose Folder")
-        folder_layout.addWidget(self.lbl_folder, 3)
-        folder_layout.addWidget(self.btn_choose_files, 1)
-        folder_layout.addWidget(self.btn_choose_folder, 1)
+        self.lbl_folder.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
+        folder_layout.setContentsMargins(0,0,0,0)
+        self.btn_choose = QPushButton("Choose Files / Folders")
+        folder_btn_layout.addWidget(self.btn_choose)
+        folder_layout.addWidget(self.lbl_folder, 2)
+        folder_layout.addLayout(folder_btn_layout, 1)
         # controls
         ctrl_layout = QHBoxLayout()
         self.btn_start = QPushButton("Start Upload")
@@ -66,8 +69,8 @@ class MainWindow(QWidget):
         self.log = QTextEdit()
         self.log.setReadOnly(True)
         # assemble
-        self.layout.addLayout(acct_layout)
-        self.layout.addLayout(folder_layout)
+        self.layout.addLayout(acct_layout, 1)
+        self.layout.addLayout(folder_layout, 1)
         self.layout.addLayout(ctrl_layout)
         self.layout.addWidget(self.progress)
         self.layout.addWidget(self.lbl_status)
@@ -82,13 +85,9 @@ class MainWindow(QWidget):
         self.folder = None
         self.remote_base = ""  # can modify to let user choose remote base
         self.refresh_accounts()
-        # remove old btn_choose connections, add new ones for files/folder
-        try:
-            self.btn_choose.clicked.disconnect()
-        except Exception:
-            pass
-        self.btn_choose_files.clicked.connect(self.choose_files)
-        self.btn_choose_folder.clicked.connect(self.choose_folder)
+        # self.btn_choose.setFixedWidth(self.btn_remove_acct.width())
+        # Connect the unified choose button
+        self.btn_choose.clicked.connect(self.choose_files_and_folders)
 
     def shorten_path(self, path: str, max_len: int = 50) -> str:
         """中间省略显示长路径，保留头尾"""
@@ -107,62 +106,138 @@ class MainWindow(QWidget):
             self.acct_list.setCurrentRow(0)
 
 
-    def choose_files(self):
-        dialog = QFileDialog(self, "Select files to upload")
-        dialog.setFileMode(QFileDialog.FileMode.ExistingFiles)
-        dialog.setOption(QFileDialog.Option.DontUseNativeDialog, False)
-        if not dialog.exec():
+    # Unified file/folder selection using NSOpenPanel
+    def choose_files_and_folders(self):
+        panel = NSOpenPanel.openPanel()
+        panel.setCanChooseFiles_(True)
+        panel.setCanChooseDirectories_(True)
+        panel.setAllowsMultipleSelection_(True)
+        if not panel.runModal():
             return
-        selected = dialog.selectedFiles()
+        selected = [str(url.path()) for url in panel.URLs()]
         if not selected:
             return
-
         # 过滤掉隐藏文件
-        self.selected_paths = [f for f in selected if not os.path.basename(f).startswith('.')]
-        common_dir = os.path.dirname(os.path.commonpath(self.selected_paths))
-        self.base_dir = common_dir
-
-        # 构造显示文本
-        count = len(self.selected_paths)
-        if count == 1:
-            display_names = os.path.basename(self.selected_paths[0])
+        filtered_files = []
+        filtered_dirs = []
+        for p in selected:
+            name = os.path.basename(p)
+            if name.startswith('.') or name.startswith('._') or name == 'Icon\r':
+                continue
+            if os.path.isdir(p):
+                filtered_dirs.append(p)
+            else:
+                filtered_files.append(p)
+        # If any directory in selection, walk and add files (not hidden)
+        all_files = []
+        for path in filtered_files:
+            all_files.append(path)
+        for path in filtered_dirs:
+            for root, dirs, files in os.walk(path):
+                for f in files:
+                    fname = os.path.basename(f)
+                    if fname.startswith('.') or fname.startswith('._') or fname == 'Icon\r':
+                        continue
+                    all_files.append(os.path.join(root, f))
+        self.selected_paths = all_files
+        if not self.selected_paths:
+            self.lbl_folder.setText("No files selected")
+            return
+        # base_dir: common parent if multiple, or directory of single
+        if len(selected) == 1:
+            if os.path.isdir(selected[0]):
+                self.base_dir = selected[0]
+            else:
+                self.base_dir = os.path.dirname(selected[0])
         else:
-            display_names = ", ".join(os.path.basename(f) for f in self.selected_paths)
-            # 如果名称过长则压缩显示
-            if len(display_names) > 60:
-                display_names = display_names[:30] + "..." + display_names[-20:]
+            # Use common path of all selected (original, not expanded) for base_dir
+            self.base_dir = os.path.dirname(os.path.commonpath(selected))
 
-        label_text = f"Files ({count}): {display_names}"
-        self.lbl_folder.setText(self.shorten_path(label_text))
+        file_count = len(filtered_files)
+        dir_count = len(filtered_dirs)
+        file_names = [os.path.basename(f) for f in filtered_files]
+        dir_names = [os.path.basename(d) + "/" for d in filtered_dirs]
+
+        if file_count > 0 and dir_count == 0:
+            label_prefix = f"Files ({file_count}): "
+            full_list = file_names
+        elif dir_count > 0 and file_count == 0:
+            label_prefix = f"Folders ({dir_count}): "
+            full_list = dir_names
+        else:
+            label_prefix = f"Files ({file_count}) & Folders ({dir_count}): "
+            full_list = file_names + dir_names
+
+        self._full_list = full_list
+        self._label_prefix = label_prefix
+        self.update_folder_label()
 
         # 计算总字节数
         total_bytes = sum(os.path.getsize(p) for p in self.selected_paths if os.path.isfile(p))
         self.total_bytes = total_bytes
         self.log.append(f"Total upload size: {total_bytes / (1024*1024*1024):.2f} GB")
 
-    def choose_folder(self):
-        dialog = QFileDialog(self, "Select folder to upload")
-        dialog.setFileMode(QFileDialog.FileMode.Directory)
-        dialog.setOption(QFileDialog.Option.DontUseNativeDialog, False)
-        dialog.setOption(QFileDialog.Option.ShowDirsOnly, True)
-        if not dialog.exec():
+    def update_folder_label(self):
+        full_list = getattr(self, '_full_list', [])
+        label_prefix = getattr(self, '_label_prefix', '')
+        available_width = self.lbl_folder.width()
+        if available_width <= 0:
+            available_width = self.lbl_folder.sizeHint().width()
+        metrics = self.lbl_folder.fontMetrics()
+
+        # Compose label_text trying full list first
+        items = full_list
+        prefix = label_prefix
+        full_text = prefix + ", ".join(items)
+        if metrics.horizontalAdvance(full_text) <= available_width:
+            display_text = full_text
+            self.lbl_folder.setText(display_text)
             return
-        selected = dialog.selectedFiles()
-        if not selected:
-            return
-        self.base_dir = selected[0]
-        self.selected_paths = []
-        for root, dirs, files in os.walk(self.base_dir):
-            for f in files:
-                path = os.path.join(root, f)
-                name = os.path.basename(path)
-                if name.startswith('.') or name.startswith('._') or name == 'Icon\r':
-                    continue
-                self.selected_paths.append(path)
-        self.lbl_folder.setText(f"Folder: {self.shorten_path(self.base_dir)}")
-        total_bytes = sum(os.path.getsize(p) for p in self.selected_paths if os.path.isfile(p))
-        self.total_bytes = total_bytes
-        self.log.append(f"Total upload size: {total_bytes / (1024*1024*1024):.2f} GB")
+
+        # Dynamic truncation
+        left = []
+        right = []
+        remaining = items[:]
+
+        # Reserve space for "..."
+        ellipsis = "..."
+        ellipsis_width = metrics.horizontalAdvance(ellipsis)
+        prefix_width = metrics.horizontalAdvance(prefix)
+        half_width = available_width / 2
+
+        # Add from start to left while prefix + left + ", ... something" fits half available_width
+        current_text = prefix
+        while remaining:
+            next_item = remaining[0]
+            test_text = current_text + next_item + ", "
+            if metrics.horizontalAdvance(test_text) < half_width:
+                left.append(next_item)
+                current_text = test_text
+                remaining.pop(0)
+            else:
+                break
+
+        # Add from end to right while total fits
+        current_text = prefix + ", ".join(left) + ", " + ellipsis if left else prefix + ellipsis
+        remaining_right = remaining[:]
+        while remaining_right:
+            next_item = remaining_right[-1]
+            test_list = left + [ellipsis] + right + [next_item]
+            test_text = prefix + ", ".join(test_list)
+            if metrics.horizontalAdvance(test_text) <= available_width:
+                right.insert(0, next_item)
+                remaining_right.pop()
+            else:
+                break
+
+        display_list = left + [ellipsis] + right
+        display_text = prefix + ", ".join(display_list)
+        self.lbl_folder.setText(display_text)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        if hasattr(self, '_full_list'):
+            self.update_folder_label()
 
     def add_account(self):
         try:
