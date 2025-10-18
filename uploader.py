@@ -28,7 +28,10 @@ def _session_path(key: str) -> Path:
     return SESS_DIR / f"{key}.json"
 
 def _save_session(key: str, data: dict):
-    _session_path(key).write_text(json.dumps(data), encoding='utf-8')
+    try:
+        _session_path(key).write_text(json.dumps(data), encoding='utf-8')
+    except Exception:
+        pass
 
 def _load_session(key: str):
     p = _session_path(key)
@@ -150,11 +153,12 @@ def upload_file(local_path, remote_path, account_home_id=None, progress_fn=None,
     # Create session if none
     if not upload_url:
         session_url = f"https://graph.microsoft.com/v1.0/me/drive/root:/{remote_path}:/createUploadSession"
-        r = requests.post(session_url, headers=headers_json, json={})
-        if r.status_code not in (200, 201):
-            raise RuntimeError(f"Failed to create upload session: {r.status_code} {r.text}")
-        resp = r.json()
-        upload_url = resp['uploadUrl']
+        with requests.Session() as session:
+            r = session.post(session_url, headers=headers_json, json={}, timeout=10)
+            if r.status_code not in (200, 201):
+                raise RuntimeError(f"Failed to create upload session: {r.status_code} {r.text}")
+            resp = r.json()
+            upload_url = resp['uploadUrl']
         sess = {"uploadUrl": upload_url, "remote_path": remote_path}
         _save_session(key, sess)
         if log_fn:
@@ -163,13 +167,16 @@ def upload_file(local_path, remote_path, account_home_id=None, progress_fn=None,
     # Try to query current progress to resume
     uploaded_bytes = 0.0
     try:
-        q = requests.get(upload_url, headers={"Authorization": f"Bearer {token}"})
-        if q.status_code in (200, 201, 202):
-            uploaded_bytes = float(_parse_next_start(q.json()))
+        with requests.Session() as session:
+            q = session.get(upload_url, headers={"Authorization": f"Bearer {token}"}, timeout=10)
+            if q.status_code in (200, 201, 202):
+                uploaded_bytes = float(_parse_next_start(q.json()))
     except Exception:
         pass
 
     start_time = time.time()
+    last_save_time = start_time
+    chunks_since_save = 0
     # Emit initial progress if resuming
     if progress_fn and uploaded_bytes > 0:
         try:
@@ -177,11 +184,10 @@ def upload_file(local_path, remote_path, account_home_id=None, progress_fn=None,
         except TypeError:
             progress_fn(float(uploaded_bytes), float(file_size))
 
-    # Upload loop with retries
     max_retries = 5
     backoff = 1.0
 
-    with open(local_path, 'rb') as f:
+    with open(local_path, 'rb') as f, requests.Session() as session:
         # seek to resume point
         if uploaded_bytes > 0:
             f.seek(int(uploaded_bytes))
@@ -197,7 +203,7 @@ def upload_file(local_path, remote_path, account_home_id=None, progress_fn=None,
                 "Content-Range": f"bytes {int(start)}-{int(end)}/{int(file_size)}",
             }
             try:
-                resp = requests.put(upload_url, headers=put_headers, data=chunk)
+                resp = session.put(upload_url, headers=put_headers, data=chunk, timeout=30)
             except Exception as ex:
                 # network error, retry after backoff
                 if log_fn:
@@ -206,7 +212,7 @@ def upload_file(local_path, remote_path, account_home_id=None, progress_fn=None,
                 backoff = min(backoff * 2, 30)
                 # re-query session position
                 try:
-                    q = requests.get(upload_url, headers={"Authorization": f"Bearer {token}"})
+                    q = session.get(upload_url, headers={"Authorization": f"Bearer {token}"}, timeout=10)
                     if q.status_code in (200,201,202):
                         uploaded_bytes = float(_parse_next_start(q.json()))
                         f.seek(int(uploaded_bytes))
@@ -246,8 +252,14 @@ def upload_file(local_path, remote_path, account_home_id=None, progress_fn=None,
                     except TypeError:
                         progress_fn(float(uploaded_bytes), float(file_size))
 
-                # persist session after each chunk
-                _save_session(key, {"uploadUrl": upload_url, "remote_path": remote_path, "uploaded": int(uploaded_bytes)})
+                chunks_since_save += 1
+                now = time.time()
+                if chunks_since_save >= 3 or (now - last_save_time) >= 30:
+                    # persist session after every 3 chunks or 30 seconds
+                    _save_session(key, {"uploadUrl": upload_url, "remote_path": remote_path, "uploaded": int(uploaded_bytes)})
+                    last_save_time = now
+                    chunks_since_save = 0
+
                 # reset backoff on success
                 backoff = 1.0
                 continue
@@ -258,7 +270,7 @@ def upload_file(local_path, remote_path, account_home_id=None, progress_fn=None,
             time.sleep(backoff)
             backoff = min(backoff * 2, 30)
             try:
-                q = requests.get(upload_url, headers={"Authorization": f"Bearer {token}"})
+                q = session.get(upload_url, headers={"Authorization": f"Bearer {token}"}, timeout=10)
                 if q.status_code in (200,201,202):
                     uploaded_bytes = float(_parse_next_start(q.json()))
                     f.seek(int(uploaded_bytes))
