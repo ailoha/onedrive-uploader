@@ -9,6 +9,40 @@ from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 import random
 
+# --- Adaptive chunk sizing constants (OneDrive requires 320KiB multiples; practical cap 60MiB) ---
+_CHUNK_ALIGN = 320 * 1024  # 320 KiB
+_MIN_CHUNK = 2 * 1024 * 1024  # 2 MiB
+_MAX_CHUNK = 32 * 1024 * 1024  # 32 MiB (safe, below Graph 60 MiB recommendation)
+_TARGET_CHUNK_SECONDS = 8.0
+_ADJUST_EVERY_N_CHUNKS = 2
+_ADJUST_SMOOTHING = 0.6  # EMA for speed smoothing
+
+def _round_to_320k(n_bytes: int) -> int:
+    """Round up to the nearest 320KiB multiple, except allow smaller for the final fragment."""
+    if n_bytes & (_CHUNK_ALIGN - 1) == 0:
+        return max(n_bytes, _CHUNK_ALIGN)
+    return ((n_bytes + _CHUNK_ALIGN - 1) // _CHUNK_ALIGN) * _CHUNK_ALIGN
+
+def _initial_adaptive_chunk_size(file_size: float) -> int:
+    """
+    Heuristic:
+    - small (<128MiB): 8MiB
+    - medium (<512MiB): 12MiB
+    - large (<2GiB): 16MiB
+    - very large: 24MiB
+    Then align to 320KiB, clamp to [_MIN_CHUNK, _MAX_CHUNK].
+    """
+    if file_size < 128 * 1024 * 1024:
+        cs = 8 * 1024 * 1024
+    elif file_size < 512 * 1024 * 1024:
+        cs = 12 * 1024 * 1024
+    elif file_size < 2 * 1024 * 1024 * 1024:
+        cs = 16 * 1024 * 1024
+    else:
+        cs = 24 * 1024 * 1024
+    cs = _round_to_320k(cs)
+    return int(min(max(cs, _MIN_CHUNK), _MAX_CHUNK))
+
 # --- Session helpers for resumable upload ---
 # 使用系统支持的用户写入路径，避免 .app 打包后无法写入问题
 SESS_DIR = Path.home() / "Library/Application Support/OneDriveUploader/sessions"
@@ -190,9 +224,11 @@ def upload_items(file_list, base_dir="", remote_base="", account_home_id=None, p
         log_cb(f"All files uploaded ({total_bytes / (1024*1024*1024):.2f} GB in {duration:.1f}s)")
     return True
 
-def upload_file(local_path, remote_path, account_home_id=None, progress_fn=None, log_fn=None, chunk_size_mb=10, should_stop=None):
+def upload_file(local_path, remote_path, account_home_id=None, progress_fn=None, log_fn=None, should_stop=None, adaptive=True):
     """
-    使用 OneDrive 分段上传会话，支持断点续传与重试。
+    使用 OneDrive 分段上传会话，支持断点续传与重试。启用智能自适应分片算法：
+    初始分片根据文件大小自动确定，并在上传过程中动态调整，范围 2–32MiB。
+    分片满足 320KiB 对齐规则，目标每片传输时长≈8秒。
     会在 ./.sessions 目录保存会话信息，异常中断后可继续上传。
     """
     token, _ = acquire_token_silent_for_account(account_home_id)
@@ -200,7 +236,8 @@ def upload_file(local_path, remote_path, account_home_id=None, progress_fn=None,
         token, _ = acquire_token_interactive()
 
     file_size = float(os.path.getsize(local_path))
-    chunk_size = max(1, int(chunk_size_mb)) * 1024 * 1024
+    # Always use adaptive initial chunk size based on file size
+    chunk_size = _initial_adaptive_chunk_size(file_size)
 
     key = _session_key(local_path, remote_path, file_size)
     sess = _load_session(key) or {}
@@ -240,6 +277,9 @@ def upload_file(local_path, remote_path, account_home_id=None, progress_fn=None,
     start_time = time.time()
     last_save_time = start_time
     chunks_since_save = 0
+    # Adaptive control variables
+    chunks_since_adjust = 0
+    ema_speed = None  # bytes/sec
     # Emit initial progress if resuming
     if progress_fn and uploaded_bytes > 0:
         try:
@@ -273,6 +313,7 @@ def upload_file(local_path, remote_path, account_home_id=None, progress_fn=None,
                 "Content-Range": f"bytes {int(start)}-{int(end)}/{int(file_size)}",
             }
             try:
+                t0 = time.time()
                 resp = session.put(upload_url, headers=put_headers, data=chunk, timeout=(10, 120))
             except Exception as ex:
                 # network error, retrying with backoff
@@ -280,6 +321,7 @@ def upload_file(local_path, remote_path, account_home_id=None, progress_fn=None,
                     log_fn(f"Network error, retrying: {ex}")
                 time.sleep(min(backoff * (0.5 + random.random()), 30))
                 backoff = min(backoff * 2, 30)
+                chunks_since_adjust = 0
                 # re-query session position
                 try:
                     q = session.get(upload_url, headers={"Authorization": f"Bearer {token}"}, timeout=30)
@@ -345,6 +387,8 @@ def upload_file(local_path, remote_path, account_home_id=None, progress_fn=None,
                 _delete_session(key)
                 if log_fn:
                     log_fn(f"Uploaded {remote_path} ({file_size / (1024*1024*1024):.2f} GB)")
+                if log_fn:
+                    log_fn(f"Final chunk size used ~{chunk_size / (1024*1024):.1f} MiB")
                 return file_size
 
             if resp.status_code == 202:
@@ -357,6 +401,26 @@ def upload_file(local_path, remote_path, account_home_id=None, progress_fn=None,
                         uploaded_bytes = int(_parse_next_start(resp.json()))
                     except Exception:
                         uploaded_bytes = int(end + 1)
+
+                # --- Adaptive resizing based on last successful fragment time ---
+                t1 = time.time()
+                last_chunk_bytes = len(chunk)
+                last_chunk_time = max(1e-3, t1 - t0)
+                inst_speed = last_chunk_bytes / last_chunk_time  # bytes/sec
+                if ema_speed is None:
+                    ema_speed = inst_speed
+                else:
+                    ema_speed = _ADJUST_SMOOTHING * inst_speed + (1 - _ADJUST_SMOOTHING) * ema_speed
+                chunks_since_adjust += 1
+                if adaptive and chunks_since_adjust >= _ADJUST_EVERY_N_CHUNKS:
+                    target_bytes = ema_speed * _TARGET_CHUNK_SECONDS
+                    new_chunk = int(min(max(_round_to_320k(int(target_bytes)), _MIN_CHUNK), _MAX_CHUNK))
+                    # Avoid tiny oscillations; only apply if change is significant (>=25%)
+                    if abs(new_chunk - chunk_size) / float(chunk_size) >= 0.25:
+                        chunk_size = new_chunk
+                        if log_fn:
+                            log_fn(f"Adjusted chunk size to {chunk_size / (1024*1024):.1f} MiB based on ~{ema_speed/1024/1024:.2f} MiB/s")
+                    chunks_since_adjust = 0
 
                 # update speed & eta
                 elapsed = max(1e-6, time.time() - start_time)
@@ -393,6 +457,7 @@ def upload_file(local_path, remote_path, account_home_id=None, progress_fn=None,
                 log_fn(f"Chunk upload failed: {resp.status_code} {resp.text[:200]}")
             time.sleep(min(backoff * (0.5 + random.random()), 30))
             backoff = min(backoff * 2, 30)
+            chunks_since_adjust = 0
             try:
                 q = session.get(upload_url, headers={"Authorization": f"Bearer {token}"}, timeout=30)
                 if q.status_code in (200, 201, 202):
