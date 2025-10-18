@@ -70,17 +70,48 @@ def _delete_session(key: str):
             pass
 
 def _parse_next_start(resp_json: dict) -> int:
-    # nextExpectedRanges like ["0-","10485760-"]
+    """
+    Parse OneDrive upload session's nextExpectedRanges and return the smallest start offset.
+    Examples: ["0-"], ["10485760-"], ["10485760-20971519","25165824-"]
+    """
     ranges = resp_json.get('nextExpectedRanges') or []
-    if not ranges:
-        return 0
-    first = str(ranges[0])
-    # format "start-end" or "start-"
-    start_str = first.split('-')[0]
+    min_start = None
+    for rng in ranges:
+        try:
+            # accept formats like "start-" or "start-end"
+            start_str = str(rng).split('-', 1)[0].strip()
+            s = int(start_str)
+            if min_start is None or s < min_start:
+                min_start = s
+        except Exception:
+            continue
+    return int(min_start or 0)
+
+def _parse_uploaded_from_headers(range_header: str | None) -> int | None:
+    """
+    Parse server-reported uploaded position from Range/Content-Range headers.
+    Examples:
+      Range: "bytes=0-10485759" -> returns 10485760
+      Content-Range: "bytes 0-10485759/52428800" -> returns 10485760
+    """
+    if not range_header:
+        return None
     try:
-        return int(start_str)
+        val = range_header.strip()
+        # remove prefix like "bytes=" or "bytes "
+        if '=' in val:
+            val = val.split('=', 1)[1]
+        elif ' ' in val:
+            val = val.split(' ', 1)[1]
+        # now "start-end" or "start-end/total"
+        parts = val.split('/', 1)[0]  # drop "/total" if present
+        start_end = parts.split('-', 1)
+        if len(start_end) != 2:
+            return None
+        end = int(start_end[1])
+        return end + 1
     except Exception:
-        return 0
+        return None
 
 def upload_items(file_list, base_dir="", remote_base="", account_home_id=None, progress_cb=None, log_cb=None, should_stop=None):
     # 保留 base_dir 的最后一级目录作为远程根
@@ -192,12 +223,17 @@ def upload_file(local_path, remote_path, account_home_id=None, progress_fn=None,
             log_fn("Upload session created")
 
     # Try to query current progress to resume
-    uploaded_bytes = 0.0
+    uploaded_bytes = 0
     try:
         with _create_session() as session:
             q = session.get(upload_url, headers={"Authorization": f"Bearer {token}"}, timeout=30)
             if q.status_code in (200, 201, 202):
-                uploaded_bytes = float(_parse_next_start(q.json()))
+                # Prefer headers if present. Fallback to nextExpectedRanges JSON.
+                hdr_pos = _parse_uploaded_from_headers(q.headers.get("Range") or q.headers.get("Content-Range"))
+                if hdr_pos is not None:
+                    uploaded_bytes = int(hdr_pos)
+                else:
+                    uploaded_bytes = int(_parse_next_start(q.json()))
     except Exception:
         pass
 
@@ -207,7 +243,7 @@ def upload_file(local_path, remote_path, account_home_id=None, progress_fn=None,
     # Emit initial progress if resuming
     if progress_fn and uploaded_bytes > 0:
         try:
-            progress_fn(float(uploaded_bytes), float(file_size), 0.0, max(0.0, (file_size-uploaded_bytes)/1.0))
+            progress_fn(float(uploaded_bytes), float(file_size), 0.0, max(0.0, (file_size - uploaded_bytes)))
         except TypeError:
             progress_fn(float(uploaded_bytes), float(file_size))
 
@@ -229,7 +265,7 @@ def upload_file(local_path, remote_path, account_home_id=None, progress_fn=None,
             chunk = f.read(chunk_size)
             if not chunk:
                 break
-            start = uploaded_bytes
+            start = int(uploaded_bytes)
             end = start + len(chunk) - 1
             put_headers = {
                 "Authorization": f"Bearer {token}",
@@ -247,9 +283,10 @@ def upload_file(local_path, remote_path, account_home_id=None, progress_fn=None,
                 # re-query session position
                 try:
                     q = session.get(upload_url, headers={"Authorization": f"Bearer {token}"}, timeout=30)
-                    if q.status_code in (200,201,202):
-                        uploaded_bytes = float(_parse_next_start(q.json()))
-                        f.seek(int(uploaded_bytes))
+                    if q.status_code in (200, 201, 202):
+                        hdr_pos = _parse_uploaded_from_headers(q.headers.get("Range") or q.headers.get("Content-Range"))
+                        uploaded_bytes = int(hdr_pos if hdr_pos is not None else _parse_next_start(q.json()))
+                        f.seek(uploaded_bytes)
                         continue
                 except Exception:
                     pass
@@ -260,9 +297,10 @@ def upload_file(local_path, remote_path, account_home_id=None, progress_fn=None,
                     log_fn("Range conflict or resource modified. Realigning to server position.")
                 try:
                     q = session.get(upload_url, headers={"Authorization": f"Bearer {token}"}, timeout=30)
-                    if q.status_code in (200,201,202):
-                        uploaded_bytes = float(_parse_next_start(q.json()))
-                        f.seek(int(uploaded_bytes))
+                    if q.status_code in (200, 201, 202):
+                        hdr_pos = _parse_uploaded_from_headers(q.headers.get("Range") or q.headers.get("Content-Range"))
+                        uploaded_bytes = int(hdr_pos if hdr_pos is not None else _parse_next_start(q.json()))
+                        f.seek(uploaded_bytes)
                         backoff = 1.0
                         continue
                 except Exception:
@@ -276,9 +314,10 @@ def upload_file(local_path, remote_path, account_home_id=None, progress_fn=None,
                     token = new_token
                     try:
                         q = session.get(upload_url, headers={"Authorization": f"Bearer {token}"}, timeout=30)
-                        if q.status_code in (200,201,202):
-                            uploaded_bytes = float(_parse_next_start(q.json()))
-                            f.seek(int(uploaded_bytes))
+                        if q.status_code in (200, 201, 202):
+                            hdr_pos = _parse_uploaded_from_headers(q.headers.get("Range") or q.headers.get("Content-Range"))
+                            uploaded_bytes = int(hdr_pos if hdr_pos is not None else _parse_next_start(q.json()))
+                            f.seek(uploaded_bytes)
                             backoff = 1.0
                             continue
                     except Exception:
@@ -297,7 +336,7 @@ def upload_file(local_path, remote_path, account_home_id=None, progress_fn=None,
 
             if resp.status_code in (200, 201):
                 # finished
-                uploaded_bytes = file_size
+                uploaded_bytes = int(file_size)
                 if progress_fn:
                     try:
                         progress_fn(float(uploaded_bytes), float(file_size), 0.0, 0.0)
@@ -310,10 +349,14 @@ def upload_file(local_path, remote_path, account_home_id=None, progress_fn=None,
 
             if resp.status_code == 202:
                 # accepted partial, advance by reported range or our chunk
-                try:
-                    uploaded_bytes = float(_parse_next_start(resp.json()))
-                except Exception:
-                    uploaded_bytes = float(end + 1)
+                hdr_pos = _parse_uploaded_from_headers(resp.headers.get("Range") or resp.headers.get("Content-Range"))
+                if hdr_pos is not None:
+                    uploaded_bytes = int(hdr_pos)
+                else:
+                    try:
+                        uploaded_bytes = int(_parse_next_start(resp.json()))
+                    except Exception:
+                        uploaded_bytes = int(end + 1)
 
                 # update speed & eta
                 elapsed = max(1e-6, time.time() - start_time)
@@ -352,9 +395,10 @@ def upload_file(local_path, remote_path, account_home_id=None, progress_fn=None,
             backoff = min(backoff * 2, 30)
             try:
                 q = session.get(upload_url, headers={"Authorization": f"Bearer {token}"}, timeout=30)
-                if q.status_code in (200,201,202):
-                    uploaded_bytes = float(_parse_next_start(q.json()))
-                    f.seek(int(uploaded_bytes))
+                if q.status_code in (200, 201, 202):
+                    hdr_pos = _parse_uploaded_from_headers(q.headers.get("Range") or q.headers.get("Content-Range"))
+                    uploaded_bytes = int(hdr_pos if hdr_pos is not None else _parse_next_start(q.json()))
+                    f.seek(uploaded_bytes)
             except Exception:
                 pass
 
