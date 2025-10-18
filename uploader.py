@@ -10,10 +10,10 @@ from urllib3.util.retry import Retry
 import random
 import threading
 
-# --- Adaptive chunk sizing constants (OneDrive requires 320KiB multiples; practical cap 60MiB) ---
+ # --- Adaptive chunk sizing constants (OneDrive requires 320KiB multiples; strict 60MiB cap) ---
 _CHUNK_ALIGN = 320 * 1024  # 320 KiB
 _MIN_CHUNK = 2 * 1024 * 1024  # 2 MiB
-_MAX_CHUNK = 32 * 1024 * 1024  # 32 MiB (safe, below Graph 60 MiB recommendation)
+_MAX_CHUNK = 60 * 1024 * 1024  # 60 MiB (strict Graph API limit)
 _TARGET_CHUNK_SECONDS = 8.0
 _ADJUST_EVERY_N_CHUNKS = 2
 _ADJUST_SMOOTHING = 0.3  # EMA for speed smoothing
@@ -365,11 +365,13 @@ def upload_file(local_path, remote_path, account_home_id=None, progress_fn=None,
     max_retries = 5
     backoff = 1.0
 
-    with open(local_path, 'rb') as f:
+    f = open(local_path, 'rb')
+    try:
         session = _get_session()
         # seek to resume point
         if uploaded_bytes > 0:
             f.seek(int(uploaded_bytes))
+        buffer = bytearray(chunk_size)
         while uploaded_bytes < file_size:
             # Check for user-requested stop before reading next chunk
             if callable(should_stop) and should_stop():
@@ -378,14 +380,16 @@ def upload_file(local_path, remote_path, account_home_id=None, progress_fn=None,
                     log_fn("Stop requested. Current session saved for resume.")
                 return uploaded_bytes
 
-            chunk = f.read(chunk_size)
-            if not chunk:
+            # Read next chunk into buffer
+            n = f.readinto(buffer)
+            if not n:
                 break
+            chunk = memoryview(buffer)[:n]
             start = int(uploaded_bytes)
-            end = start + len(chunk) - 1
+            end = start + n - 1
             put_headers = {
                 "Authorization": f"Bearer {token}",
-                "Content-Length": str(len(chunk)),
+                "Content-Length": str(n),
                 "Content-Range": f"bytes {int(start)}-{int(end)}/{int(file_size)}",
             }
             try:
@@ -502,7 +506,7 @@ def upload_file(local_path, remote_path, account_home_id=None, progress_fn=None,
 
                 # --- Adaptive resizing based on last successful fragment time ---
                 t1 = time.time()
-                last_chunk_bytes = len(chunk)
+                last_chunk_bytes = n
                 last_chunk_time = max(1e-3, t1 - t0)
                 inst_speed = last_chunk_bytes / last_chunk_time  # bytes/sec
                 if ema_speed is None:
@@ -516,6 +520,7 @@ def upload_file(local_path, remote_path, account_home_id=None, progress_fn=None,
                     # Avoid tiny oscillations; only apply if change is significant (>=25%)
                     if abs(new_chunk - chunk_size) / float(chunk_size) >= 0.25:
                         chunk_size = new_chunk
+                        buffer = bytearray(chunk_size)
                         if log_fn:
                             log_fn(f"Adjusted chunk size to {chunk_size / (1024*1024):.1f} MiB based on ~{ema_speed/1024/1024:.2f} MiB/s")
                     chunks_since_adjust = 0
@@ -568,6 +573,11 @@ def upload_file(local_path, remote_path, account_home_id=None, progress_fn=None,
             except Exception:
                 pass
 
+    finally:
+        try:
+            f.close()
+        except Exception:
+            pass
     # If loop ends without completion, keep session for resume
     if log_fn:
         log_fn("Upload interrupted; session saved for resume")
