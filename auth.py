@@ -29,7 +29,8 @@ def _load_cache():
     cache = SerializableTokenCache()
     if os.path.exists(CACHE_FILE):
         try:
-            cache.deserialize(open(CACHE_FILE, "rb").read())
+            with open(CACHE_FILE, "rb") as f:
+                cache.deserialize(f.read())
         except Exception:
             pass
     return cache
