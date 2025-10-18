@@ -18,13 +18,23 @@ class UploadWorker(QThread):
         self.account_home_id = account_home_id
         self._stop = False
 
+    def request_stop(self):
+        self._stop = True
+
     def run(self):
         try:
             def log_cb(s):
                 self.log.emit(s)
             def progress_cb(uploaded, total, speed=None, eta=None):
                 self.progress.emit(int(uploaded), int(total), float(speed or 0), float(eta or 0))
-            upload_items(self.selected_paths, base_dir=self.base_dir, account_home_id=self.account_home_id, progress_cb=progress_cb, log_cb=log_cb)
+            upload_items(
+                self.selected_paths,
+                base_dir=self.base_dir,
+                account_home_id=self.account_home_id,
+                progress_cb=progress_cb,
+                log_cb=log_cb,
+                should_stop=lambda: self._stop
+            )
             self.finished.emit(True)
         except Exception as e:
             self.log.emit("ERROR: " + str(e))
@@ -85,7 +95,6 @@ class MainWindow(QWidget):
         self.folder = None
         self.remote_base = ""  # can modify to let user choose remote base
         self.refresh_accounts()
-        # self.btn_choose.setFixedWidth(self.btn_remove_acct.width())
         # Connect the unified choose button
         self.btn_choose.clicked.connect(self.choose_files_and_folders)
 
@@ -262,9 +271,9 @@ class MainWindow(QWidget):
 
     def stop_upload(self):
         if self.worker and self.worker.isRunning():
-            self.worker.terminate()
-            self.worker.wait(2000)
-            self.log.append("Upload stopped by user")
+            # signal worker to stop gracefully
+            self.worker.request_stop()
+            self.log.append("Stopping... waiting for current chunk to finish")
         self.btn_start.setEnabled(True)
         self.btn_stop.setEnabled(False)
 

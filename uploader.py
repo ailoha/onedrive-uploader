@@ -1,10 +1,3 @@
-def clear_old_sessions():
-    """清空 .sessions 目录，防止无效续传残留。"""
-    for f in SESS_DIR.glob("*.json"):
-        try:
-            f.unlink()
-        except Exception:
-            pass
 import os
 import time
 import json
@@ -12,11 +5,37 @@ import requests
 import hashlib
 from pathlib import Path
 from auth import acquire_token_silent_for_account, acquire_token_interactive
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+import random
 
 # --- Session helpers for resumable upload ---
 # 使用系统支持的用户写入路径，避免 .app 打包后无法写入问题
 SESS_DIR = Path.home() / "Library/Application Support/OneDriveUploader/sessions"
 SESS_DIR.mkdir(parents=True, exist_ok=True)
+
+def _create_session():
+    session = requests.Session()
+    retry = Retry(
+        total=7,
+        connect=7, read=7, status=7,
+        backoff_factor=1.2,
+        status_forcelist=[429, 500, 502, 503, 504],
+        allowed_methods=["HEAD","GET","PUT","POST"]
+    )
+    adapter = HTTPAdapter(max_retries=retry, pool_connections=16, pool_maxsize=16, pool_block=True)
+    session.mount("https://", adapter)
+    session.mount("http://", adapter)
+    session.headers.update({"Connection": "keep-alive"})
+    return session
+
+def clear_old_sessions():
+    """清空 .sessions 目录，防止无效续传残留。"""
+    for f in SESS_DIR.glob("*.json"):
+        try:
+            f.unlink()
+        except Exception:
+            pass
 
 def _session_key(local_path: str, remote_path: str, file_size: float) -> str:
     st = os.stat(local_path)
@@ -62,8 +81,8 @@ def _parse_next_start(resp_json: dict) -> int:
         return int(start_str)
     except Exception:
         return 0
-def upload_items(file_list, base_dir="", remote_base="", account_home_id=None, progress_cb=None, log_cb=None):
 
+def upload_items(file_list, base_dir="", remote_base="", account_home_id=None, progress_cb=None, log_cb=None, should_stop=None):
     # 保留 base_dir 的最后一级目录作为远程根
     if base_dir:
         base_dir = os.path.abspath(base_dir)
@@ -93,6 +112,11 @@ def upload_items(file_list, base_dir="", remote_base="", account_home_id=None, p
     start_time = time.time()
 
     for abs_path, size in abs_file_list:
+        if callable(should_stop) and should_stop():
+            if log_cb:
+                log_cb("Stop requested by user. Halting before next file.")
+            break
+
         rel = os.path.relpath(abs_path, base_dir) if base_dir else os.path.basename(abs_path)
         rel = os.path.join(top_level_name, rel)
         rp = _normalize_remote_path(remote_base, rel)
@@ -116,8 +140,13 @@ def upload_items(file_list, base_dir="", remote_base="", account_home_id=None, p
                 except TypeError:
                     progress_cb(total_uploaded, total_bytes)
 
-        actual_size = upload_file(abs_path, rp, account_home_id=account_home_id, progress_fn=pf, log_fn=log_cb)
+        actual_size = upload_file(abs_path, rp, account_home_id=account_home_id, progress_fn=pf, log_fn=log_cb, should_stop=should_stop)
         uploaded_bytes += actual_size
+
+        if actual_size < size:
+            if log_cb:
+                log_cb("Stopped during file upload. Session saved for resume.")
+            break
 
         if progress_cb:
             try:
@@ -130,13 +159,11 @@ def upload_items(file_list, base_dir="", remote_base="", account_home_id=None, p
         log_cb(f"All files uploaded ({total_bytes / (1024*1024*1024):.2f} GB in {duration:.1f}s)")
     return True
 
-def upload_file(local_path, remote_path, account_home_id=None, progress_fn=None, log_fn=None, chunk_size_mb=10):
+def upload_file(local_path, remote_path, account_home_id=None, progress_fn=None, log_fn=None, chunk_size_mb=10, should_stop=None):
     """
     使用 OneDrive 分段上传会话，支持断点续传与重试。
     会在 ./.sessions 目录保存会话信息，异常中断后可继续上传。
     """
-    import time
-
     token, _ = acquire_token_silent_for_account(account_home_id)
     if not token:
         token, _ = acquire_token_interactive()
@@ -153,8 +180,8 @@ def upload_file(local_path, remote_path, account_home_id=None, progress_fn=None,
     # Create session if none
     if not upload_url:
         session_url = f"https://graph.microsoft.com/v1.0/me/drive/root:/{remote_path}:/createUploadSession"
-        with requests.Session() as session:
-            r = session.post(session_url, headers=headers_json, json={}, timeout=10)
+        with _create_session() as session:
+            r = session.post(session_url, headers=headers_json, json={}, timeout=30)
             if r.status_code not in (200, 201):
                 raise RuntimeError(f"Failed to create upload session: {r.status_code} {r.text}")
             resp = r.json()
@@ -167,8 +194,8 @@ def upload_file(local_path, remote_path, account_home_id=None, progress_fn=None,
     # Try to query current progress to resume
     uploaded_bytes = 0.0
     try:
-        with requests.Session() as session:
-            q = session.get(upload_url, headers={"Authorization": f"Bearer {token}"}, timeout=10)
+        with _create_session() as session:
+            q = session.get(upload_url, headers={"Authorization": f"Bearer {token}"}, timeout=30)
             if q.status_code in (200, 201, 202):
                 uploaded_bytes = float(_parse_next_start(q.json()))
     except Exception:
@@ -187,11 +214,18 @@ def upload_file(local_path, remote_path, account_home_id=None, progress_fn=None,
     max_retries = 5
     backoff = 1.0
 
-    with open(local_path, 'rb') as f, requests.Session() as session:
+    with open(local_path, 'rb') as f, _create_session() as session:
         # seek to resume point
         if uploaded_bytes > 0:
             f.seek(int(uploaded_bytes))
         while uploaded_bytes < file_size:
+            # Check for user-requested stop before reading next chunk
+            if callable(should_stop) and should_stop():
+                _save_session(key, {"uploadUrl": upload_url, "remote_path": remote_path, "uploaded": int(uploaded_bytes)})
+                if log_fn:
+                    log_fn("Stop requested. Current session saved for resume.")
+                return uploaded_bytes
+
             chunk = f.read(chunk_size)
             if not chunk:
                 break
@@ -203,16 +237,16 @@ def upload_file(local_path, remote_path, account_home_id=None, progress_fn=None,
                 "Content-Range": f"bytes {int(start)}-{int(end)}/{int(file_size)}",
             }
             try:
-                resp = session.put(upload_url, headers=put_headers, data=chunk, timeout=30)
+                resp = session.put(upload_url, headers=put_headers, data=chunk, timeout=(10, 120))
             except Exception as ex:
-                # network error, retry after backoff
+                # network error, retrying with backoff
                 if log_fn:
                     log_fn(f"Network error, retrying: {ex}")
-                time.sleep(backoff)
+                time.sleep(min(backoff * (0.5 + random.random()), 30))
                 backoff = min(backoff * 2, 30)
                 # re-query session position
                 try:
-                    q = session.get(upload_url, headers={"Authorization": f"Bearer {token}"}, timeout=10)
+                    q = session.get(upload_url, headers={"Authorization": f"Bearer {token}"}, timeout=30)
                     if q.status_code in (200,201,202):
                         uploaded_bytes = float(_parse_next_start(q.json()))
                         f.seek(int(uploaded_bytes))
@@ -220,6 +254,46 @@ def upload_file(local_path, remote_path, account_home_id=None, progress_fn=None,
                 except Exception:
                     pass
                 continue
+
+            if resp.status_code in (409, 416):
+                if log_fn:
+                    log_fn("Range conflict or resource modified. Realigning to server position.")
+                try:
+                    q = session.get(upload_url, headers={"Authorization": f"Bearer {token}"}, timeout=30)
+                    if q.status_code in (200,201,202):
+                        uploaded_bytes = float(_parse_next_start(q.json()))
+                        f.seek(int(uploaded_bytes))
+                        backoff = 1.0
+                        continue
+                except Exception:
+                    pass
+
+            if resp.status_code in (401, 403) and account_home_id:
+                if log_fn:
+                    log_fn("Auth expired. Refreshing token.")
+                new_token, _ = acquire_token_silent_for_account(account_home_id)
+                if new_token:
+                    token = new_token
+                    try:
+                        q = session.get(upload_url, headers={"Authorization": f"Bearer {token}"}, timeout=30)
+                        if q.status_code in (200,201,202):
+                            uploaded_bytes = float(_parse_next_start(q.json()))
+                            f.seek(int(uploaded_bytes))
+                            backoff = 1.0
+                            continue
+                    except Exception:
+                        pass
+
+            if resp.status_code == 404:
+                try:
+                    q = session.get(upload_url, headers={"Authorization": f"Bearer {token}"}, timeout=30)
+                    if q.status_code == 404:
+                        if log_fn:
+                            log_fn("Upload session expired or invalidated by server. Saving progress and stopping.")
+                        _delete_session(key)
+                        return uploaded_bytes
+                except Exception:
+                    pass
 
             if resp.status_code in (200, 201):
                 # finished
@@ -262,15 +336,22 @@ def upload_file(local_path, remote_path, account_home_id=None, progress_fn=None,
 
                 # reset backoff on success
                 backoff = 1.0
+
+                # allow stop between chunks
+                if callable(should_stop) and should_stop():
+                    _save_session(key, {"uploadUrl": upload_url, "remote_path": remote_path, "uploaded": int(uploaded_bytes)})
+                    if log_fn:
+                        log_fn("Stop requested between chunks. Session saved.")
+                    return uploaded_bytes
                 continue
 
             # other errors -> retry with backoff and re-query nextExpectedRanges
             if log_fn:
                 log_fn(f"Chunk upload failed: {resp.status_code} {resp.text[:200]}")
-            time.sleep(backoff)
+            time.sleep(min(backoff * (0.5 + random.random()), 30))
             backoff = min(backoff * 2, 30)
             try:
-                q = session.get(upload_url, headers={"Authorization": f"Bearer {token}"}, timeout=10)
+                q = session.get(upload_url, headers={"Authorization": f"Bearer {token}"}, timeout=30)
                 if q.status_code in (200,201,202):
                     uploaded_bytes = float(_parse_next_start(q.json()))
                     f.seek(int(uploaded_bytes))
@@ -280,7 +361,8 @@ def upload_file(local_path, remote_path, account_home_id=None, progress_fn=None,
     # If loop ends without completion, keep session for resume
     if log_fn:
         log_fn("Upload interrupted; session saved for resume")
-    return file_size
+    return uploaded_bytes
+
 def _normalize_remote_path(base, rel_path):
     """
     规范化 OneDrive 远程路径，防止重复或反斜杠错误。

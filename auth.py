@@ -89,7 +89,6 @@ def complete_device_flow(flow):
         return result["access_token"], accounts[-1]
     raise RuntimeError("Device flow failed: %r" % result)
 
-
 # Interactive login flow
 def acquire_token_interactive():
     app, cache = create_msal_app()
