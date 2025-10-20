@@ -15,8 +15,43 @@ _CHUNK_ALIGN = 320 * 1024  # 320 KiB
 _MIN_CHUNK = 2 * 1024 * 1024  # 2 MiB
 _MAX_CHUNK = 60 * 1024 * 1024  # 60 MiB (strict Graph API limit)
 _TARGET_CHUNK_SECONDS = 8.0
-_ADJUST_EVERY_N_CHUNKS = 2
-_ADJUST_SMOOTHING = 0.3  # EMA for speed smoothing
+_ADJUST_EVERY_N_CHUNKS = 3
+_ADJUST_SMOOTHING = 0.2  # EMA for speed smoothing
+def _query_uploaded_bytes(upload_url, token, last_confirmed_uploaded, file_size, log_fn=None):
+    """
+    Helper to query server for uploaded position, handling Range/Content-Range/nextExpectedRanges.
+    Returns uploaded_bytes (int), possibly updated last_confirmed_uploaded.
+    """
+    session = _get_session()
+    try:
+        q = session.get(upload_url, headers={"Authorization": f"Bearer {token}"}, timeout=30)
+        if q.status_code in (200, 201, 202):
+            hdr_pos = _parse_uploaded_from_headers(q.headers.get("Range") or q.headers.get("Content-Range"))
+            if hdr_pos is not None and hdr_pos >= last_confirmed_uploaded:
+                uploaded_bytes = int(hdr_pos)
+            else:
+                uploaded_bytes = last_confirmed_uploaded
+            uploaded_bytes = max(0.0, min(float(uploaded_bytes), float(file_size)))
+            last_confirmed_uploaded = uploaded_bytes
+            if hdr_pos is None:
+                try:
+                    t_next = int(_parse_next_start(q.json()))
+                    if t_next >= last_confirmed_uploaded:
+                        uploaded_bytes = t_next
+                    else:
+                        uploaded_bytes = last_confirmed_uploaded
+                    last_confirmed_uploaded = uploaded_bytes
+                except Exception:
+                    pass
+            uploaded_bytes = max(0.0, min(float(uploaded_bytes), float(file_size)))
+            return uploaded_bytes, last_confirmed_uploaded
+        else:
+            # For 404, 409, etc, just return last_confirmed_uploaded
+            return last_confirmed_uploaded, last_confirmed_uploaded
+    except Exception as ex:
+        if log_fn:
+            log_fn(f"Exception in querying uploaded bytes: {ex}")
+        return last_confirmed_uploaded, last_confirmed_uploaded
 
 def _round_to_320k(n_bytes: int) -> int:
     """Round up to the nearest 320KiB multiple, except allow smaller for the final fragment."""
@@ -367,30 +402,7 @@ def upload_file(local_path, remote_path, account_home_id=None, progress_fn=None,
     # Try to query current progress to resume
     uploaded_bytes = 0
     last_confirmed_uploaded = 0
-    try:
-        session = _get_session()
-        q = session.get(upload_url, headers={"Authorization": f"Bearer {token}"}, timeout=30)
-        if q.status_code in (200, 201, 202):
-            # Prefer headers if present. Fallback to nextExpectedRanges JSON.
-            hdr_pos = _parse_uploaded_from_headers(q.headers.get("Range") or q.headers.get("Content-Range"))
-            if hdr_pos is not None and hdr_pos >= last_confirmed_uploaded:
-                uploaded_bytes = int(hdr_pos)
-            else:
-                uploaded_bytes = last_confirmed_uploaded
-            uploaded_bytes = max(0.0, min(float(uploaded_bytes), float(file_size)))
-            last_confirmed_uploaded = uploaded_bytes
-            if hdr_pos is None:
-                try:
-                    t_next = int(_parse_next_start(q.json()))
-                    if t_next >= last_confirmed_uploaded:
-                        uploaded_bytes = t_next
-                    else:
-                        uploaded_bytes = last_confirmed_uploaded
-                    last_confirmed_uploaded = uploaded_bytes
-                except Exception:
-                    pass
-    except Exception:
-        pass
+    uploaded_bytes, last_confirmed_uploaded = _query_uploaded_bytes(upload_url, token, last_confirmed_uploaded, file_size, log_fn=log_fn)
 
     start_time = time.time()
     last_save_time = start_time
@@ -415,6 +427,8 @@ def upload_file(local_path, remote_path, account_home_id=None, progress_fn=None,
         if uploaded_bytes > 0:
             f.seek(int(uploaded_bytes))
         buffer = bytearray(chunk_size)
+        # --- Progress update control ---
+        last_progress_time = time.time()
         while uploaded_bytes < file_size:
             # Check for user-requested stop before reading next chunk
             if callable(should_stop) and should_stop():
@@ -448,76 +462,19 @@ def upload_file(local_path, remote_path, account_home_id=None, progress_fn=None,
                 backoff = min(backoff * 2, 30)
                 chunks_since_adjust = 0
                 # re-query session position
-                try:
-                    q = session.get(upload_url, headers={"Authorization": f"Bearer {token}"}, timeout=30)
-                    if q.status_code in (200, 201, 202):
-                        hdr_pos = _parse_uploaded_from_headers(q.headers.get("Range") or q.headers.get("Content-Range"))
-                        if hdr_pos is not None and hdr_pos >= last_confirmed_uploaded:
-                            uploaded_bytes = int(hdr_pos)
-                        else:
-                            uploaded_bytes = last_confirmed_uploaded
-                        uploaded_bytes = max(0.0, min(float(uploaded_bytes), float(file_size)))
-                        last_confirmed_uploaded = uploaded_bytes
-                        if hdr_pos is None:
-                            try:
-                                t_next = int(_parse_next_start(q.json()))
-                                if t_next >= last_confirmed_uploaded:
-                                    uploaded_bytes = t_next
-                                else:
-                                    uploaded_bytes = last_confirmed_uploaded
-                                last_confirmed_uploaded = uploaded_bytes
-                            except Exception:
-                                pass
-                        uploaded_bytes = max(0.0, min(float(uploaded_bytes), float(file_size)))
-                        f.seek(uploaded_bytes)
-                        continue
-                except Exception:
-                    pass
-                uploaded_bytes = max(0.0, min(float(uploaded_bytes), float(file_size)))
+                uploaded_bytes, last_confirmed_uploaded = _query_uploaded_bytes(upload_url, token, last_confirmed_uploaded, file_size, log_fn=log_fn)
+                f.seek(int(uploaded_bytes))
                 continue
 
             if resp.status_code in (409, 416):
                 if log_fn:
                     log_fn("Range conflict or resource modified. Realigning to server position.")
-                try:
-                    q = session.get(upload_url, headers={"Authorization": f"Bearer {token}"}, timeout=30)
-                    if q.status_code in (200, 201, 202):
-                        hdr_pos = _parse_uploaded_from_headers(q.headers.get("Range") or q.headers.get("Content-Range"))
-                        if hdr_pos is not None and hdr_pos >= last_confirmed_uploaded:
-                            uploaded_bytes = int(hdr_pos)
-                        else:
-                            uploaded_bytes = last_confirmed_uploaded
-                        uploaded_bytes = max(0.0, min(float(uploaded_bytes), float(file_size)))
-                        last_confirmed_uploaded = uploaded_bytes
-                        if hdr_pos is None:
-                            try:
-                                t_next = int(_parse_next_start(q.json()))
-                                if t_next >= last_confirmed_uploaded:
-                                    uploaded_bytes = t_next
-                                else:
-                                    uploaded_bytes = last_confirmed_uploaded
-                                last_confirmed_uploaded = uploaded_bytes
-                            except Exception:
-                                pass
-                        uploaded_bytes = max(0.0, min(float(uploaded_bytes), float(file_size)))
-                        f.seek(int(uploaded_bytes))
-                        backoff = 1.0
-                        if log_fn:
-                            log_fn("409 conflict handled successfully, retrying current chunk...")
-                        time.sleep(1.0)
-                        continue
-                    else:
-                        if log_fn:
-                            log_fn(f"409 conflict recovery GET failed ({q.status_code}); will retry after backoff.")
-                except Exception as ex:
-                    if log_fn:
-                        log_fn(f"Exception during 409 recovery: {ex}; will retry after backoff.")
-                # fallback: reset session and retry after short delay
-                _reset_session()
-                session = _get_session()
-                time.sleep(min(backoff * (0.5 + random.random()), 5))
-                backoff = min(backoff * 2, 30)
-                chunks_since_adjust = 0
+                uploaded_bytes, last_confirmed_uploaded = _query_uploaded_bytes(upload_url, token, last_confirmed_uploaded, file_size, log_fn=log_fn)
+                f.seek(int(uploaded_bytes))
+                backoff = 1.0
+                if log_fn:
+                    log_fn("409 conflict handled successfully, retrying current chunk...")
+                time.sleep(1.0)
                 continue
 
             if resp.status_code in (401, 403) and account_home_id:
@@ -526,66 +483,43 @@ def upload_file(local_path, remote_path, account_home_id=None, progress_fn=None,
                 new_token, _ = acquire_token_silent_for_account(account_home_id)
                 if new_token:
                     token = new_token
-                    try:
-                        q = session.get(upload_url, headers={"Authorization": f"Bearer {token}"}, timeout=30)
-                        if q.status_code in (200, 201, 202):
-                            hdr_pos = _parse_uploaded_from_headers(q.headers.get("Range") or q.headers.get("Content-Range"))
-                            if hdr_pos is not None and hdr_pos >= last_confirmed_uploaded:
-                                uploaded_bytes = int(hdr_pos)
-                            else:
-                                uploaded_bytes = last_confirmed_uploaded
-                            uploaded_bytes = max(0.0, min(float(uploaded_bytes), float(file_size)))
-                            last_confirmed_uploaded = uploaded_bytes
-                            if hdr_pos is None:
-                                try:
-                                    t_next = int(_parse_next_start(q.json()))
-                                    if t_next >= last_confirmed_uploaded:
-                                        uploaded_bytes = t_next
-                                    else:
-                                        uploaded_bytes = last_confirmed_uploaded
-                                    last_confirmed_uploaded = uploaded_bytes
-                                except Exception:
-                                    pass
-                            uploaded_bytes = max(0.0, min(float(uploaded_bytes), float(file_size)))
-                            f.seek(uploaded_bytes)
-                            backoff = 1.0
-                            continue
-                    except Exception:
-                        pass
+                    uploaded_bytes, last_confirmed_uploaded = _query_uploaded_bytes(upload_url, token, last_confirmed_uploaded, file_size, log_fn=log_fn)
+                    f.seek(int(uploaded_bytes))
+                    backoff = 1.0
+                    continue
 
             if resp.status_code == 404:
                 # Upload session expired or invalidated by server. Try to recreate automatically.
+                uploaded_bytes, last_confirmed_uploaded = _query_uploaded_bytes(upload_url, token, last_confirmed_uploaded, file_size, log_fn=log_fn)
+                if log_fn:
+                    log_fn("Upload session expired or invalidated by server. Attempting to recreate session and resume.")
+                _delete_session(key)
+                # Create new session
+                session_url = f"https://graph.microsoft.com/v1.0/me/drive/root:/{remote_path}:/createUploadSession"
+                session = _get_session()
                 try:
-                    q = session.get(upload_url, headers={"Authorization": f"Bearer {token}"}, timeout=30)
-                    if q.status_code == 404:
-                        if log_fn:
-                            log_fn("Upload session expired or invalidated by server. Attempting to recreate session and resume.")
-                        _delete_session(key)
-                        # Create new session
-                        session_url = f"https://graph.microsoft.com/v1.0/me/drive/root:/{remote_path}:/createUploadSession"
-                        session = _get_session()
-                        r = session.post(session_url, headers=headers_json, json={}, timeout=30)
-                        if r.status_code not in (200, 201):
-                            if log_fn:
-                                log_fn(f"Failed to recreate upload session: {r.status_code} {r.text}")
-                            uploaded_bytes = max(0.0, min(float(uploaded_bytes), float(file_size)))
-                            return uploaded_bytes
-                        resp = r.json()
-                        upload_url = resp['uploadUrl']
-                        sess = {"uploadUrl": upload_url, "remote_path": remote_path}
-                        _save_session(key, sess)
-                        # Seek to current uploaded_bytes position
-                        uploaded_bytes = max(0.0, min(float(uploaded_bytes), float(file_size)))
-                        f.seek(uploaded_bytes)
-                        if log_fn:
-                            log_fn("New upload session created. Resuming upload from previous position.")
-                        backoff = 1.0
-                        continue
+                    r = session.post(session_url, headers=headers_json, json={}, timeout=30)
                 except Exception as ex:
                     if log_fn:
                         log_fn(f"Failed to recreate upload session after 404: {ex}")
                     uploaded_bytes = max(0.0, min(float(uploaded_bytes), float(file_size)))
                     return uploaded_bytes
+                if r.status_code not in (200, 201):
+                    if log_fn:
+                        log_fn(f"Failed to recreate upload session: {r.status_code} {r.text}")
+                    uploaded_bytes = max(0.0, min(float(uploaded_bytes), float(file_size)))
+                    return uploaded_bytes
+                respj = r.json()
+                upload_url = respj['uploadUrl']
+                sess = {"uploadUrl": upload_url, "remote_path": remote_path}
+                _save_session(key, sess)
+                # Seek to current uploaded_bytes position
+                uploaded_bytes = max(0.0, min(float(uploaded_bytes), float(file_size)))
+                f.seek(int(uploaded_bytes))
+                if log_fn:
+                    log_fn("New upload session created. Resuming upload from previous position.")
+                backoff = 1.0
+                continue
 
             if resp.status_code in (200, 201):
                 # finished
@@ -599,7 +533,6 @@ def upload_file(local_path, remote_path, account_home_id=None, progress_fn=None,
                 _delete_session(key)
                 if log_fn:
                     log_fn(f"Uploaded {remote_path} ({int(file_size)} B)")
-                if log_fn:
                     log_fn(f"Final chunk size used {int(chunk_size)} B")
                 return file_size
 
@@ -637,10 +570,14 @@ def upload_file(local_path, remote_path, account_home_id=None, progress_fn=None,
                 if adaptive and chunks_since_adjust >= _ADJUST_EVERY_N_CHUNKS:
                     target_bytes = ema_speed * _TARGET_CHUNK_SECONDS
                     new_chunk = int(min(max(_round_to_320k(int(target_bytes)), _MIN_CHUNK), _MAX_CHUNK))
-                    # Avoid tiny oscillations; only apply if change is significant (>=25%)
-                    if abs(new_chunk - chunk_size) / float(chunk_size) >= 0.25:
+                    # Only apply if change is significant (>=30%)
+                    if abs(new_chunk - chunk_size) / float(chunk_size) >= 0.3:
+                        # If chunk_size increases, extend buffer in place if possible
+                        if new_chunk > chunk_size:
+                            buffer.extend(bytearray(new_chunk - chunk_size))
+                        else:
+                            buffer = bytearray(new_chunk)
                         chunk_size = new_chunk
-                        buffer = bytearray(chunk_size)
                         if log_fn:
                             log_fn(f"Adjusted chunk size to {int(chunk_size)} B based on ~{int(ema_speed)} B/s")
                     chunks_since_adjust = 0
@@ -650,11 +587,16 @@ def upload_file(local_path, remote_path, account_home_id=None, progress_fn=None,
                 speed = uploaded_bytes / elapsed
                 eta = (file_size - uploaded_bytes) / speed if speed > 0 else 0.0
 
-                if progress_fn:
+                # --- Progress update control ---
+                now = time.time()
+                # 每上传完一个分块立即刷新，且至少每10秒刷新一次
+                if progress_fn and (now - last_progress_time >= 10 or chunks_since_adjust >= 1 or uploaded_bytes == file_size):
                     try:
                         progress_fn(float(uploaded_bytes), float(file_size), float(speed), float(eta))
                     except TypeError:
                         progress_fn(float(uploaded_bytes), float(file_size))
+                    last_progress_time = now
+                    chunks_since_adjust = 0
 
                 chunks_since_save += 1
                 now = time.time()
@@ -685,30 +627,8 @@ def upload_file(local_path, remote_path, account_home_id=None, progress_fn=None,
             time.sleep(min(backoff * (0.5 + random.random()), 30))
             backoff = min(backoff * 2, 30)
             chunks_since_adjust = 0
-            try:
-                q = session.get(upload_url, headers={"Authorization": f"Bearer {token}"}, timeout=30)
-                if q.status_code in (200, 201, 202):
-                    hdr_pos = _parse_uploaded_from_headers(q.headers.get("Range") or q.headers.get("Content-Range"))
-                    if hdr_pos is not None and hdr_pos >= last_confirmed_uploaded:
-                        uploaded_bytes = int(hdr_pos)
-                    else:
-                        uploaded_bytes = last_confirmed_uploaded
-                    uploaded_bytes = max(0.0, min(float(uploaded_bytes), float(file_size)))
-                    last_confirmed_uploaded = uploaded_bytes
-                    if hdr_pos is None:
-                        try:
-                            t_next = int(_parse_next_start(q.json()))
-                            if t_next >= last_confirmed_uploaded:
-                                uploaded_bytes = t_next
-                            else:
-                                uploaded_bytes = last_confirmed_uploaded
-                            last_confirmed_uploaded = uploaded_bytes
-                        except Exception:
-                            pass
-                    uploaded_bytes = max(0.0, min(float(uploaded_bytes), float(file_size)))
-                    f.seek(uploaded_bytes)
-            except Exception:
-                pass
+            uploaded_bytes, last_confirmed_uploaded = _query_uploaded_bytes(upload_url, token, last_confirmed_uploaded, file_size, log_fn=log_fn)
+            f.seek(int(uploaded_bytes))
 
     finally:
         try:

@@ -2,6 +2,7 @@
 import sys, os
 from PyQt6.QtWidgets import QApplication, QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QLabel, QListWidget, QFileDialog, QProgressBar, QTextEdit, QMessageBox, QSizePolicy
 from PyQt6.QtCore import QThread, pyqtSignal, Qt
+from PyQt6.QtGui import QTextCursor
 from auth import list_accounts, acquire_token_interactive, remove_account
 from uploader import upload_items
 from Cocoa import NSOpenPanel
@@ -50,11 +51,13 @@ class UploadWorker(QThread):
                 should_stop=lambda: self._stop
             )
             self.finished.emit(True)
-        except Exception as e:
-            self.log.emit("ERROR: " + str(e))
+        except Exception:
+            import traceback
+            self.log.emit("ERROR:\n" + traceback.format_exc())
             self.finished.emit(False)
 
 class MainWindow(QWidget):
+    MAX_LOG_LINES = 1000
     def __init__(self):
         super().__init__()
         self.setWindowTitle("OneDrive Uploader")
@@ -111,6 +114,35 @@ class MainWindow(QWidget):
         self.refresh_accounts()
         # Connect the unified choose button
         self.btn_choose.clicked.connect(self.choose_files_and_folders)
+
+    def _append_log(self, message: str):
+        """Append formatted log efficiently and trim to last MAX_LOG_LINES lines."""
+        # format any raw byte values first
+        formatted = self._format_log_message(message)
+        cursor = self.log.textCursor()
+        cursor.movePosition(QTextCursor.MoveOperation.End)
+        cursor.insertText(formatted + "\n")
+        self.log.setTextCursor(cursor)
+        self.log.ensureCursorVisible()
+        # trim lines if too many
+        doc = self.log.document()
+        if doc.blockCount() > self.MAX_LOG_LINES:
+            # remove earliest extra lines
+            extra = doc.blockCount() - self.MAX_LOG_LINES
+            b = doc.begin()
+            rm = 0
+            cur = self.log.textCursor()
+            cur.beginEditBlock()
+            while extra > 0 and b.isValid():
+                nxt = b.next()
+                cur.setPosition(b.position())
+                cur.movePosition(QTextCursor.MoveOperation.EndOfBlock, QTextCursor.MoveMode.KeepAnchor)
+                cur.movePosition(QTextCursor.MoveOperation.Right, QTextCursor.MoveMode.KeepAnchor)  # include newline
+                cur.removeSelectedText()
+                rm += 1
+                extra -= 1
+                b = nxt
+            cur.endEditBlock()
 
     def refresh_accounts(self):
         self.acct_list.clear()
@@ -203,7 +235,7 @@ class MainWindow(QWidget):
                 return f"{mb:.1f} MB"
             gb = mb / 1024
             return f"{gb:.2f} GB"
-        self.log.append(f"Total upload size: {format_size(total_bytes)}")
+        self._append_log(f"Total upload size: {format_size(total_bytes)}")
 
     def update_folder_label(self):
         full_list = getattr(self, '_full_list', [])
@@ -255,7 +287,7 @@ class MainWindow(QWidget):
         try:
             token, acc = acquire_token_interactive()
             QMessageBox.information(self, "Signed In", f"Signed in as {acc.get('username')}")
-            self.log.append(f"Signed in: {acc.get('username')}")
+            self._append_log(f"Signed in: {acc.get('username')}")
             self.refresh_accounts()
         except Exception as e:
             QMessageBox.critical(self, "Error", str(e))
@@ -270,7 +302,7 @@ class MainWindow(QWidget):
             hid = text.split("[")[-1].split("]")[0]
             ok = remove_account(hid)
             if ok:
-                self.log.append(f"Removed account {hid}")
+                self._append_log(f"Removed account {hid}")
                 self.refresh_accounts()
             else:
                 QMessageBox.warning(self, "Remove", "Failed to remove account")
@@ -283,6 +315,10 @@ class MainWindow(QWidget):
         if row < 0:
             QMessageBox.warning(self, "No account", "Add and select an account")
             return
+        # Thread lifecycle management: prevent multiple uploads
+        if self.worker and self.worker.isRunning():
+            QMessageBox.warning(self, "Busy", "An upload task is still running.")
+            return
         text = self.acct_list.currentItem().text()
         hid = text.split("[")[-1].split("]")[0]
 
@@ -292,16 +328,16 @@ class MainWindow(QWidget):
         # 传 selected_paths 和 base_dir 给上传线程
         self.worker = UploadWorker(self.selected_paths, self.base_dir, account_home_id=hid)
         self.worker.progress.connect(self.on_progress)
-        self.worker.log.connect(lambda s: self.log.append(self._format_log_message(s)))
+        self.worker.log.connect(self._append_log)
         self.worker.finished.connect(lambda ok: self.on_finished(ok))
         self.worker.start()
-        self.log.append("Upload started")
+        self._append_log("Upload started")
 
     def stop_upload(self):
         if self.worker and self.worker.isRunning():
             # signal worker to stop gracefully
             self.worker.request_stop()
-            self.log.append("Stopping... waiting for current chunk to finish")
+            self._append_log("Stopping... waiting for current chunk to finish")
         self.btn_start.setEnabled(True)
         self.btn_stop.setEnabled(False)
 
@@ -311,7 +347,8 @@ class MainWindow(QWidget):
         total = getattr(self, "total_bytes", _ignored_total) or 0
         if total > 0:
             pct = int(uploaded * 100 / total)
-            self.progress.setValue(pct)
+            if pct != self.progress.value():
+                self.progress.setValue(pct)
 
             # --- 单位换算（动态单位显示） ---
             def format_size(bytes_value):
@@ -342,7 +379,7 @@ class MainWindow(QWidget):
             uploaded_str = format_size(uploaded)
             total_str = format_size(total)
             mbps = (speed or 0) / (1024 * 1024)
-            eta_str = format_time(eta)
+            eta_str = format_time(eta) if eta and eta > 0 else "\u221e"
 
             # --- 界面更新（进度条和状态标签） ---
             self.lbl_status.setText(
@@ -355,8 +392,14 @@ class MainWindow(QWidget):
     def on_finished(self, ok):
         self.btn_start.setEnabled(True)
         self.btn_stop.setEnabled(False)
-        self.log.append("Upload finished" if ok else "Upload ended with errors")
+        self._append_log("Upload finished" if ok else "Upload ended with errors")
         self.refresh_accounts()
+        if self.worker:
+            try:
+                self.worker.deleteLater()
+            except Exception:
+                pass
+            self.worker = None
     def _format_log_message(self, message: str) -> str:
         """Convert raw byte values in uploader logs to human-readable units."""
         import re
