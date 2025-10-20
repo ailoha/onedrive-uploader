@@ -4,6 +4,8 @@
 
 这是个基于 Python 和 PyQt 构建的、简单的**macOS**桌面图形界面应用程序，用于将文件和文件夹上传到 **OneDrive for Business**，支持断点续传。
 
+![demo](public/demo.png)
+
 ## 🚀 功能特性
 
 - 上传文件和文件夹到 **OneDrive for Business**

@@ -7,7 +7,8 @@ from uploader import upload_items
 from Cocoa import NSOpenPanel
 
 class UploadWorker(QThread):
-    progress = pyqtSignal(int, int, float, float)
+    # progress: (uploaded_bytes, total_bytes, speed_bytes_per_sec, eta_seconds)
+    progress = pyqtSignal(float, float, float, float)
     log = pyqtSignal(str)
     finished = pyqtSignal(bool)
 
@@ -22,11 +23,24 @@ class UploadWorker(QThread):
         self._stop = True
 
     def run(self):
+        """
+        Worker thread main upload logic.
+        Callback naming:
+        - log_cb: emits log messages.
+        - progress_cb: emits upload progress (bytes).
+        """
         try:
-            def log_cb(s):
-                self.log.emit(s)
-            def progress_cb(uploaded, total, speed=None, eta=None):
-                self.progress.emit(int(uploaded), int(total), float(speed or 0), float(eta or 0))
+            def log_cb(message):
+                # Emit log message to main thread
+                self.log.emit(message)
+            def progress_cb(uploaded_bytes, total_bytes, speed_bytes_per_sec=None, eta_seconds=None):
+                # Emit upload progress (all in bytes, seconds)
+                self.progress.emit(
+                    float(uploaded_bytes),
+                    float(total_bytes),
+                    float(speed_bytes_per_sec or 0),
+                    float(eta_seconds or 0)
+                )
             upload_items(
                 self.selected_paths,
                 base_dir=self.base_dir,
@@ -117,40 +131,40 @@ class MainWindow(QWidget):
         selected = [str(url.path()) for url in panel.URLs()]
         if not selected:
             return
-        # 过滤掉隐藏文件
+        # --- Hidden file filtering ---
         filtered_files = []
         filtered_dirs = []
-        for p in selected:
-            name = os.path.basename(p)
+        for path in selected:
+            name = os.path.basename(path)
             if name.startswith('.') or name.startswith('._') or name == 'Icon\r':
                 continue
-            if os.path.isdir(p):
-                filtered_dirs.append(p)
+            if os.path.isdir(path):
+                filtered_dirs.append(path)
             else:
-                filtered_files.append(p)
-        # If any directory in selection, walk and add files (not hidden)
+                filtered_files.append(path)
+        # --- Expand directories to file list (skip hidden) ---
         all_files = []
-        for path in filtered_files:
-            all_files.append(path)
-        for path in filtered_dirs:
-            for root, dirs, files in os.walk(path):
-                for f in files:
-                    fname = os.path.basename(f)
-                    if fname.startswith('.') or fname.startswith('._') or fname == 'Icon\r':
+        for f in filtered_files:
+            all_files.append(f)
+        for d in filtered_dirs:
+            for root, dirs, files in os.walk(d):
+                for fname in files:
+                    base = os.path.basename(fname)
+                    if base.startswith('.') or base.startswith('._') or base == 'Icon\r':
                         continue
-                    all_files.append(os.path.join(root, f))
+                    all_files.append(os.path.join(root, fname))
         self.selected_paths = all_files
         if not self.selected_paths:
             self.lbl_folder.setText("No files selected")
             return
-        # base_dir: common parent if multiple, or directory of single
+        # --- Determine base_dir ---
         if len(selected) == 1:
             if os.path.isdir(selected[0]):
                 self.base_dir = selected[0]
             else:
                 self.base_dir = os.path.dirname(selected[0])
         else:
-            # Use common path of all selected (original, not expanded) for base_dir
+            # Use common parent path of all selected (original, not expanded)
             self.base_dir = os.path.dirname(os.path.commonpath(selected))
 
         file_count = len(filtered_files)
@@ -172,10 +186,24 @@ class MainWindow(QWidget):
         self._label_prefix = label_prefix
         self.update_folder_label()
 
-        # 计算总字节数
+        # --- Calculate total upload size (bytes) ---
         total_bytes = sum(os.path.getsize(p) for p in self.selected_paths if os.path.isfile(p))
         self.total_bytes = total_bytes
-        self.log.append(f"Total upload size: {total_bytes / (1024*1024*1024):.2f} GB")
+
+        # --- Log total size with dynamic unit for readability ---
+        def format_size(bytes_value):
+            # --- Dynamic unit conversion for logging ---
+            if bytes_value < 1024:
+                return f"{bytes_value:.1f} B"
+            kb = bytes_value / 1024
+            if kb < 1024:
+                return f"{kb:.1f} KB"
+            mb = kb / 1024
+            if mb < 1024:
+                return f"{mb:.1f} MB"
+            gb = mb / 1024
+            return f"{gb:.2f} GB"
+        self.log.append(f"Total upload size: {format_size(total_bytes)}")
 
     def update_folder_label(self):
         full_list = getattr(self, '_full_list', [])
@@ -264,7 +292,7 @@ class MainWindow(QWidget):
         # 传 selected_paths 和 base_dir 给上传线程
         self.worker = UploadWorker(self.selected_paths, self.base_dir, account_home_id=hid)
         self.worker.progress.connect(self.on_progress)
-        self.worker.log.connect(lambda s: self.log.append(s))
+        self.worker.log.connect(lambda s: self.log.append(self._format_log_message(s)))
         self.worker.finished.connect(lambda ok: self.on_finished(ok))
         self.worker.start()
         self.log.append("Upload started")
@@ -279,13 +307,15 @@ class MainWindow(QWidget):
 
     def on_progress(self, uploaded, _ignored_total, speed=0, eta=0):
         QApplication.processEvents()
+        # --- 进度计算 ---
         total = getattr(self, "total_bytes", _ignored_total) or 0
         if total > 0:
             pct = int(uploaded * 100 / total)
             self.progress.setValue(pct)
 
-            # ---- 动态单位换算 ----
+            # --- 单位换算（动态单位显示） ---
             def format_size(bytes_value):
+                # --- Dynamic unit conversion ---
                 if bytes_value < 1024:
                     return f"{bytes_value:.1f} B"
                 kb = bytes_value / 1024
@@ -311,11 +341,12 @@ class MainWindow(QWidget):
 
             uploaded_str = format_size(uploaded)
             total_str = format_size(total)
-            mbps = speed / (1024 * 1024)
+            mbps = (speed or 0) / (1024 * 1024)
             eta_str = format_time(eta)
 
+            # --- 界面更新（进度条和状态标签） ---
             self.lbl_status.setText(
-                f"{uploaded_str} / {total_str} | {mbps:.2f} MB/s | ETA: {eta_str}"
+                f"{uploaded_str} / {total_str} | {mbps:.2f} MB/s | ETA: {eta_str if eta else '--'}"
             )
         else:
             self.progress.setValue(0)
@@ -326,3 +357,20 @@ class MainWindow(QWidget):
         self.btn_stop.setEnabled(False)
         self.log.append("Upload finished" if ok else "Upload ended with errors")
         self.refresh_accounts()
+    def _format_log_message(self, message: str) -> str:
+        """Convert raw byte values in uploader logs to human-readable units."""
+        import re
+        def format_bytes(match):
+            try:
+                num = int(match.group(1))
+            except Exception:
+                return match.group(0)
+            if num < 1024:
+                return f"{num} B"
+            elif num < 1024 ** 2:
+                return f"{num / 1024:.1f} KB"
+            elif num < 1024 ** 3:
+                return f"{num / (1024 ** 2):.1f} MB"
+            else:
+                return f"{num / (1024 ** 3):.2f} GB"
+        return re.sub(r"(\d+) B", format_bytes, message)

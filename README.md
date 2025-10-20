@@ -4,7 +4,9 @@ English | [中文简体](./README.zh-CN.md)
 
 A simple desktop GUI application for uploading files and folders to **OneDrive for Business** on **macOS**, with resume support.
 
-Built with Python and PyQt.  
+Built with Python and PyQt. 
+
+![demo](public/demo.png)
 
 ## 🚀 Features
 
